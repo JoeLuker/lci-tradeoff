@@ -1,0 +1,26 @@
+# LCI Framework Configuration
+
+# Population parameters
+pop_size: 100 # Number of agents in the population
+
+# Environment parameters
+n_states: 16 # Number of states in the Markov environment
+n_actions: 4 # Number of actions available to agents
+
+# Neural network parameters
+hidden_size: 64 # Size of hidden layers in the neural network
+n_layers: 2 # Number of hidden layers
+dropout_rate: 0.1 # Dropout rate for regularization
+
+# Evolution parameters
+mutation_rate: 0.1 # Probability of mutation during reproduction
+tournament_size: 5 # Number of agents competing in tournament selection
+elitism: 0.1 # Fraction of population preserved via elitism
+
+# Training parameters
+n_generations: 50 # Number of generations to run
+steps_per_generation: 200 # Environment steps per generation
+learning_rate: 0.001 # Learning rate for neural network updates
+
+# Output parameters
+output_dir: 'results/lci_run' # Directory to save results

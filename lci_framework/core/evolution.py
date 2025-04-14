@@ -1,508 +1,536 @@
 """
-Evolution Framework Module
+GPU-Optimized Tensor Evolution
 
-This module implements a population-based evolutionary framework for optimizing
-LCI (Losslessness, Compression, Invariance) agent parameters.
+This module implements a fully vectorized evolutionary algorithm that 
+optimizes agent populations using GPU acceleration.
 """
 
+import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import random
-import multiprocessing as mp
-from typing import Dict, List, Tuple, Optional, Union, Callable
-import logging
-from pathlib import Path
-import json
 import os
-from datetime import datetime
+import logging
+import time
+import matplotlib.pyplot as plt
+import json
+from typing import Dict, List, Tuple, Any, Optional, Union
+from pathlib import Path
 from tqdm import tqdm
 
-from lci_framework.environments.markov_environment import MarkovEnvironment
-from lci_framework.agents.lci_agent import LCIAgent
+from lci_framework.agents.agent import TensorLCIAgent
+from lci_framework.environments.environment import VectorizedMarkovEnvironment
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
-class LCIEvolution:
+class TensorEvolution:
     """
-    Population-based optimization for LCI strategies
+    GPU-accelerated evolution framework for optimizing LCI agent populations.
     
-    This class manages a population of agents with different LCI parameters,
-    evaluates their fitness, and evolves the population over time.
-    
-    Attributes:
-        env_config (dict): Configuration for the environment
-        pop_size (int): Population size
-        mutation_rate (float): Probability of mutation during reproduction
-        tournament_size (int): Number of agents to select for tournament selection
-        elitism (int): Number of top agents to preserve as-is
-        env (MarkovEnvironment): The environment for agent evaluation
-        population (list): List of LCIAgent instances
-        generation (int): Current generation number
-        fitness_history (list): History of average fitness values
-        lci_history (list): History of average LCI parameters
+    Uses tensor operations to efficiently evaluate and evolve agent populations.
     """
     
-    def __init__(
-        self,
-        env_config: Dict,
-        pop_size: int = 50,
-        mutation_rate: float = 0.1,
-        tournament_size: int = 5,
-        elitism: int = 2,
-        seed: Optional[int] = None,
-        output_dir: str = "results"
-    ):
+    def __init__(self,
+                pop_size: int = 100,
+                mutation_rate: float = 0.1,
+                tournament_size: int = 5,
+                elitism: int = 1,
+                n_states: int = 10,
+                n_actions: int = 4,
+                n_generations: int = 100,
+                steps_per_generation: int = 1000,
+                hidden_size: int = 64,
+                n_layers: int = 2,
+                learning_rate: float = 0.01,
+                dropout_rate: float = 0.1,
+                l1_reg: float = 0.001,
+                l2_reg: float = 0.001,
+                energy_cost_predict: float = 0.01,
+                energy_cost_learn: float = 0.1,
+                energy_init: float = 1.0,
+                energy_recovery: float = 0.05,
+                output_dir: str = "results",
+                device: Optional[torch.device] = None):
         """
-        Initialize the evolution framework
+        Initialize the tensor evolution framework.
         
         Args:
-            env_config: Configuration for the environment
-            pop_size: Population size
-            mutation_rate: Probability of mutation during reproduction
-            tournament_size: Number of agents to select for tournament selection
-            elitism: Number of top agents to preserve as-is
-            seed: Random seed for reproducibility
-            output_dir: Directory for saving results
+            pop_size: Number of agents in the population
+            mutation_rate: Probability of mutation for each parameter
+            tournament_size: Number of agents per tournament
+            elitism: Number of top agents to preserve each generation
+            n_states: Number of states in the environment
+            n_actions: Number of actions in the environment
+            n_generations: Number of generations to evolve
+            steps_per_generation: Number of environment steps for each generation
+            hidden_size: Size of hidden layers in neural networks
+            n_layers: Number of layers in neural networks
+            learning_rate: Learning rate for neural network training
+            dropout_rate: Dropout rate for neural networks
+            l1_reg: L1 regularization weight
+            l2_reg: L2 regularization weight
+            energy_cost_predict: Energy cost for making a prediction
+            energy_cost_learn: Energy cost for learning
+            energy_init: Initial energy level
+            energy_recovery: Energy recovery rate per step
+            output_dir: Directory to save results
+            device: Device for computation (auto-detected if None)
         """
-        # Input validation
-        if pop_size <= 0:
-            raise ValueError("Population size must be positive")
-        if not 0 <= mutation_rate <= 1:
-            raise ValueError("Mutation rate must be between 0 and 1")
-        if tournament_size <= 0 or tournament_size > pop_size:
-            raise ValueError("Tournament size must be positive and not greater than population size")
-        if elitism < 0 or elitism > pop_size // 2:
-            raise ValueError("Elitism must be non-negative and not greater than half the population size")
-            
-        self.env_config = env_config
+        # Validate parameters
+        assert pop_size > 0, "Population size must be positive"
+        assert 0 <= mutation_rate <= 1, "Mutation rate must be between 0 and 1"
+        assert 1 <= tournament_size <= pop_size, "Tournament size must be between 1 and population size"
+        assert 0 <= elitism <= pop_size, "Elitism must be between 0 and population size"
+        assert n_generations > 0, "Number of generations must be positive"
+        assert steps_per_generation > 0, "Steps per generation must be positive"
+        
+        # Store parameters
         self.pop_size = pop_size
         self.mutation_rate = mutation_rate
         self.tournament_size = tournament_size
         self.elitism = elitism
+        self.n_generations = n_generations
+        self.steps_per_generation = steps_per_generation
         self.output_dir = output_dir
+        self.n_states = n_states
+        self.n_actions = n_actions
         
-        # Create output directory if it doesn't exist
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        # Set up device
+        if device is None:
+            if torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+                logger.info("Using MPS device for evolution")
+                print("Using MPS device (Apple Silicon GPU)")
+            elif torch.cuda.is_available():
+                self.device = torch.device("cuda")
+                logger.info("Using CUDA device for evolution")
+                print("Using CUDA device (NVIDIA GPU)")
+            else:
+                raise RuntimeError("No GPU available. This implementation requires GPU acceleration.")
+        else:
+            self.device = device
+            logger.info(f"Using specified device: {device}")
         
-        # Set random seed if provided
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            logger.info(f"Set random seed: {seed}")
+        # Create vectorized environment
+        self.env = VectorizedMarkovEnvironment(
+            n_states=n_states,
+            n_actions=n_actions,
+            device=self.device
+        )
         
-        # Create environment
-        self.env = MarkovEnvironment(**env_config)
+        # Initialize environment with population size
+        self.env.reset(pop_size=pop_size)
         
-        # Initialize population
-        self.population = []
-        self._initialize_population()
+        # Create population of agents
+        self.agents = TensorLCIAgent(
+            pop_size=pop_size,
+            input_size=n_states,
+            energy_cost_predict=energy_cost_predict,
+            energy_cost_learn=energy_cost_learn,
+            energy_init=energy_init,
+            energy_recovery=energy_recovery,
+            learning_rate=learning_rate,
+            hidden_size=hidden_size,
+            n_layers=n_layers,
+            dropout_rate=dropout_rate,
+            l1_reg=l1_reg,
+            l2_reg=l2_reg,
+            device=self.device
+        )
         
-        # Tracking statistics
+        # Create directory for results
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Initialize tracking variables
         self.generation = 0
         self.fitness_history = []
         self.lci_history = []
         self.best_agent_history = []
+        self.best_fitness = float('-inf')
+        self.best_agent_generation = 0
         
-        logger.info(f"Initialized evolution with population size {pop_size}")
-        
-    def _initialize_population(self):
-        """
-        Initialize population with random LCI parameters
-        
-        Creates a diverse initial population with different LCI parameter combinations.
-        """
-        for i in range(self.pop_size):
-            # Randomize LCI parameters for each agent
-            agent = LCIAgent(
-                input_size=self.env.n_states,
-                learning_rate=random.uniform(0.001, 0.1),   # L parameter
-                hidden_size=random.randint(8, 128),         # C parameter
-                n_layers=random.randint(1, 3),              # C parameter
-                l1_reg=random.uniform(0, 0.01),            # I parameter
-                l2_reg=random.uniform(0, 0.01),            # I parameter
-                dropout_rate=random.uniform(0, 0.5),       # I parameter
-                agent_id=i
-            )
-            self.population.append(agent)
-            
-        logger.debug(f"Created initial population of {len(self.population)} agents")
+        logger.info(f"Tensor Evolution initialized with {pop_size} agents")
     
-    def evaluate_fitness(self, steps_per_eval: int = 100) -> List[Dict]:
+    def evaluate_fitness(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Evaluate fitness of all agents in the population
+        Evaluate the fitness of the entire population of agents using the environment.
         
-        Args:
-            steps_per_eval: Number of steps to run each evaluation
-            
         Returns:
-            List of fitness results for each agent
+            Tuple of (fitness_tensor, lci_tensor)
         """
-        results = []
+        # Reset environment for evaluation
+        states = self.env.reset(pop_size=self.pop_size)
         
-        # Check if multiprocessing should be used
-        use_multiprocessing = self.pop_size > 4
+        # Initialize fitness tensor for all agents
+        fitness = torch.zeros(self.pop_size, device=self.device)
+        lci_values = torch.zeros(self.pop_size, device=self.device)
         
-        if use_multiprocessing:
-            # Process agents efficiently using multiprocessing
-            num_processes = min(mp.cpu_count(), self.pop_size)
-            logger.info(f"Evaluating population using {num_processes} processes")
+        # Get alive mask for all agents
+        alive_mask = self.agents.get_energy() > 0
+        
+        # Run simulation for steps_per_generation steps
+        total_rewards = torch.zeros(self.pop_size, device=self.device)
+        step_counts = torch.zeros(self.pop_size, device=self.device)
+        
+        for _ in tqdm(range(self.steps_per_generation), desc=f"Generation {self.generation+1}"):
+            # Get predictions for all agents
+            predictions = self.agents.predict(states)
             
-            with mp.Pool(processes=num_processes) as pool:
-                results = pool.map(
-                    self._evaluate_agent_fitness,
-                    [(agent, steps_per_eval) for agent in self.population]
-                )
-        else:
-            # Sequential processing for debugging or small populations
-            logger.info("Evaluating population sequentially")
-            for agent in tqdm(self.population, desc="Evaluating agents"):
-                results.append(self._evaluate_agent_fitness((agent, steps_per_eval)))
-        
-        # Update fitness history
-        avg_fitness = np.mean([r["fitness"] for r in results])
-        self.fitness_history.append(avg_fitness)
-        
-        # Update LCI history
-        l_avg = np.mean([agent.lci_params["L"] for agent in self.population])
-        c_avg = np.mean([agent.lci_params["C"] for agent in self.population])
-        i_avg = np.mean([agent.lci_params["I"] for agent in self.population])
-        
-        self.lci_history.append((l_avg, c_avg, i_avg))
-        
-        # Track best agent
-        best_result = max(results, key=lambda x: x["fitness"])
-        self.best_agent_history.append(best_result)
-        
-        return results
-    
-    def _evaluate_agent_fitness(self, args) -> Dict:
-        """
-        Helper function for parallel fitness evaluation
-        
-        Args:
-            args: Tuple of (agent, steps_per_eval)
+            # Step environment forward
+            next_states, rewards, dones, _ = self.env.step_batch(predictions)
             
-        Returns:
-            Dictionary with fitness results
-        """
-        agent, steps_per_eval = args
-        
-        # Create a separate environment for this evaluation
-        env = MarkovEnvironment(**self.env_config)
-        
-        # Initialize trackers
-        total_reward = 0
-        prediction_errors = []
-        survived_steps = 0
-        
-        # Reset environment
-        obs = env.get_observation(env.reset())
-        
-        # Run simulation for specified number of steps
-        for t in range(steps_per_eval):
-            # Update environment volatility
-            env.update_environment(t)
+            # Update total rewards and step counts for alive agents
+            for i in range(self.pop_size):
+                if alive_mask[i]:
+                    total_rewards[i] += rewards[i]
+                    step_counts[i] += 1
             
-            # Agent predicts next state
-            pred_state = agent.predict(obs)
+            # Learn from transition for all alive agents
+            self.agents.learn(states, rewards)
             
-            # Environment takes a step
-            next_state, reward = env.step()
-            next_obs = env.get_observation(next_state)
+            # Update states
+            states = next_states
             
-            # Agent learns from transition
-            error = agent.learn(obs, next_obs)
-            prediction_errors.append(error)
+            # Update energy levels
+            self.agents.update_energy()
             
-            # Agent receives reward
-            agent.receive_reward(reward)
-            total_reward += reward
+            # Update alive mask
+            alive_mask = self.agents.get_energy() > 0
             
-            # Check if agent is still alive
-            if not agent.is_alive():
+            # If all agents are dead, break early
+            if not alive_mask.any():
+                logger.warning("All agents depleted energy, ending generation early")
                 break
-                
-            # Update observation
-            obs = next_obs
-            survived_steps = t + 1
         
-        # Calculate fitness
-        fitness = total_reward
+        # Calculate fitness as total reward
+        fitness = total_rewards
         
-        # Calculate stability across environment changes
-        # Higher is better - less variation in performance during volatility changes
-        if len(prediction_errors) > 1:
-            stability = 1.0 / (1.0 + np.std(prediction_errors))
-        else:
-            stability = 0
-            
-        # Calculate efficiency
-        efficiency = agent.energy / agent.initial_energy
+        # Calculate LCI as average reward per step (for agents that took at least one step)
+        for i in range(self.pop_size):
+            if step_counts[i] > 0:
+                lci_values[i] = total_rewards[i] / step_counts[i]
         
-        # Calculate LCI balance
-        lci_balance = agent.get_lci_balance()
-        
-        return {
-            "agent_id": agent.agent_id,
-            "fitness": fitness,
-            "reward": total_reward,
-            "steps_survived": survived_steps,
-            "stability": stability,
-            "efficiency": efficiency,
-            "lci_balance": lci_balance,
-            "lci_params": agent.lci_params,
-            "final_energy": agent.energy
-        }
-    
-    def selection_and_reproduction(self, fitness_results: List[Dict]):
+        return fitness, lci_values
+
+    def selection_and_reproduction(self, fitness: torch.Tensor) -> None:
         """
-        Select parents and create next generation
+        Select parents based on tournament selection and create new population.
         
         Args:
-            fitness_results: List of fitness evaluation results
+            fitness: Fitness tensor for current population
         """
-        # Sort agents by fitness
-        sorted_results = sorted(fitness_results, key=lambda x: x["fitness"], reverse=True)
+        # Ensure fitness is on the correct device
+        fitness = fitness.to(self.device)
         
-        # Create next generation
-        next_generation = []
+        # Initialize new population
+        new_population = TensorLCIAgent(
+            pop_size=self.pop_size,
+            input_size=self.n_states,
+            energy_cost_predict=self.agents.energy_cost_predict,
+            energy_cost_learn=self.agents.energy_cost_learn,
+            energy_init=self.agents.energy_init,
+            energy_recovery=self.agents.energy_recovery,
+            learning_rate=self.agents.learning_rate,
+            hidden_size=self.agents.model.hidden_size,
+            n_layers=self.agents.model.n_layers,
+            dropout_rate=self.agents.model.dropout_rate,
+            l1_reg=self.agents.l1_reg,
+            l2_reg=self.agents.l2_reg,
+            device=self.device
+        )
         
-        # Elitism: Keep top performing agents
-        for i in range(self.elitism):
-            if i < len(sorted_results):
-                elite_id = sorted_results[i]["agent_id"]
-                elite_agent = next(a for a in self.population if a.agent_id == elite_id)
-                next_generation.append(elite_agent)
-                logger.debug(f"Elite agent {elite_id} preserved with fitness {sorted_results[i]['fitness']:.3f}")
+        # Elitism: Copy the best agents
+        num_elite = max(1, int(self.elitism * self.pop_size) if isinstance(self.elitism, float) else self.elitism)
         
-        # Fill the rest with offspring from tournament selection
-        while len(next_generation) < self.pop_size:
-            # Tournament selection for parent 1
-            parent1 = self._tournament_selection(fitness_results)
+        if num_elite > 0:
+            # Get indices of elite agents
+            elite_indices = torch.topk(fitness, num_elite).indices
             
-            # Tournament selection for parent 2
-            parent2 = self._tournament_selection(fitness_results)
-            
-            # Create offspring through crossover and mutation
-            offspring = self._crossover_and_mutate(parent1, parent2)
-            next_generation.append(offspring)
+            # Copy elite agents' parameters - using detach() to avoid gradient issues
+            for i, idx in enumerate(elite_indices):
+                # Copy model parameters (this would need model-specific logic)
+                for target_layer, source_layer in zip(new_population.model.layers, self.agents.model.layers):
+                    # Using assign instead of in-place operations to avoid autograd issues
+                    weight_copy = source_layer.weight[idx].clone().detach()
+                    with torch.no_grad():
+                        target_layer.weight[i].copy_(weight_copy)
+                    
+                    if target_layer.bias is not None:
+                        bias_copy = source_layer.bias[idx].clone().detach()
+                        with torch.no_grad():
+                            target_layer.bias[i].copy_(bias_copy)
+                
+                # Copy output layer parameters
+                output_weight_copy = self.agents.model.output_layer.weight[idx].clone().detach()
+                with torch.no_grad():
+                    new_population.model.output_layer.weight[i].copy_(output_weight_copy)
+                
+                if new_population.model.output_layer.bias is not None:
+                    output_bias_copy = self.agents.model.output_layer.bias[idx].clone().detach()
+                    with torch.no_grad():
+                        new_population.model.output_layer.bias[i].copy_(output_bias_copy)
         
-        # Update population
-        self.population = next_generation
+        # Tournament selection for the rest of the population
+        for i in range(num_elite, self.pop_size):
+            # Select tournament participants
+            tournament_indices = torch.randint(0, self.pop_size, (self.tournament_size,), device=self.device)
+            tournament_fitness = fitness[tournament_indices]
+            
+            # Select the winner
+            winner_idx = tournament_indices[torch.argmax(tournament_fitness)]
+            
+            # Copy winner's parameters to new population
+            for target_layer, source_layer in zip(new_population.model.layers, self.agents.model.layers):
+                weight_copy = source_layer.weight[winner_idx].clone().detach()
+                with torch.no_grad():
+                    target_layer.weight[i].copy_(weight_copy)
+                
+                if target_layer.bias is not None:
+                    bias_copy = source_layer.bias[winner_idx].clone().detach()
+                    with torch.no_grad():
+                        target_layer.bias[i].copy_(bias_copy)
+                    
+            # Copy output layer parameters
+            output_weight_copy = self.agents.model.output_layer.weight[winner_idx].clone().detach()
+            with torch.no_grad():
+                new_population.model.output_layer.weight[i].copy_(output_weight_copy)
+            
+            if new_population.model.output_layer.bias is not None:
+                output_bias_copy = self.agents.model.output_layer.bias[winner_idx].clone().detach()
+                with torch.no_grad():
+                    new_population.model.output_layer.bias[i].copy_(output_bias_copy)
+        
+        # Apply mutation to non-elite agents
+        for i in range(num_elite, self.pop_size):
+            # Apply mutation with probability mutation_rate
+            mutation_mask = torch.rand(size=(1,), device=self.device) < self.mutation_rate
+            
+            if mutation_mask.item():
+                # Mutate parameters
+                for layer in new_population.model.layers:
+                    # Add Gaussian noise to weights
+                    with torch.no_grad():
+                        layer.weight[i] += torch.randn_like(layer.weight[i]) * 0.1
+                    
+                    if layer.bias is not None:
+                        with torch.no_grad():
+                            layer.bias[i] += torch.randn_like(layer.bias[i]) * 0.1
+                
+                # Mutate output layer
+                with torch.no_grad():
+                    new_population.model.output_layer.weight[i] += torch.randn_like(new_population.model.output_layer.weight[i]) * 0.1
+                
+                if new_population.model.output_layer.bias is not None:
+                    with torch.no_grad():
+                        new_population.model.output_layer.bias[i] += torch.randn_like(new_population.model.output_layer.bias[i]) * 0.1
+        
+        # Replace the old population with the new one
+        self.agents = new_population
+        
+        # Reset environment for the new generation
+        self.env.update_environment()
+        # Initialize environment with the population size
+        self.env.reset(pop_size=self.pop_size)
+    
+    def run_generation(self, steps: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run a single generation of the evolutionary algorithm.
+        
+        Args:
+            steps: Number of steps to run
+            
+        Returns:
+            Tuple of (fitness_tensor, lci_tensor)
+        """
+        # Store the current steps_per_generation
+        original_steps = self.steps_per_generation
+        self.steps_per_generation = steps
+        
+        # Evaluate fitness
+        fitness, lci_values = self.evaluate_fitness()
+        
+        # Track the best agent
+        best_idx = torch.argmax(fitness).item()
+        best_fitness_gen = fitness[best_idx].item()
+        
+        if best_fitness_gen > self.best_fitness:
+            self.best_fitness = best_fitness_gen
+            self.best_agent_generation = self.generation
+            
+            # Save the best agent
+            os.makedirs(f"{self.output_dir}/best_agents", exist_ok=True)
+            self.agents.save_agent(f"{self.output_dir}/best_agents/best_agent_gen_{self.generation}")
+        
+        # Log statistics
+        mean_fitness = fitness.mean().item()
+        std_fitness = fitness.std().item()
+        max_fitness = fitness.max().item()
+        mean_lci = lci_values.mean().item()
+        alive_count = (self.agents.get_energy() > 0).sum().item()
+        
+        logger.info(f"Generation {self.generation+1}: "
+                   f"Mean Fitness = {mean_fitness:.4f}, "
+                   f"Max Fitness = {max_fitness:.4f}, "
+                   f"Mean LCI = {mean_lci:.4f}, "
+                   f"Alive Agents = {alive_count}/{self.pop_size}")
+        
+        # Store history
+        self.fitness_history.append({
+            'mean': mean_fitness,
+            'std': std_fitness,
+            'max': max_fitness
+        })
+        self.lci_history.append({
+            'mean': mean_lci,
+            'max': lci_values.max().item(),
+            'alive_count': alive_count
+        })
+        self.best_agent_history.append({
+            'generation': self.generation,
+            'fitness': best_fitness_gen,
+            'lci': lci_values[best_idx].item()
+        })
+        
+        # Increment generation counter
         self.generation += 1
         
-        logger.info(f"Created generation {self.generation} with {len(self.population)} agents")
+        # Selection and reproduction
+        self.selection_and_reproduction(fitness)
+        
+        # Restore original steps
+        self.steps_per_generation = original_steps
+        
+        return fitness, lci_values
     
-    def _tournament_selection(self, fitness_results: List[Dict]) -> LCIAgent:
+    def run_simulation(self, n_generations=None, steps_per_generation=None, learning_rate=None) -> Dict:
         """
-        Select an agent using tournament selection
+        Run the evolutionary simulation for n_generations.
         
         Args:
-            fitness_results: List of fitness evaluation results
+            n_generations: Override the number of generations to run
+            steps_per_generation: Override the number of steps per generation
+            learning_rate: Override the learning rate for the agents
             
         Returns:
-            Selected agent
+            Dictionary of results
         """
-        # Randomly select tournament_size agents
-        tournament_indices = random.sample(range(len(fitness_results)), min(self.tournament_size, len(fitness_results)))
-        tournament = [fitness_results[i] for i in tournament_indices]
+        start_time = time.time()
         
-        # Select the one with highest fitness
-        winner_id = max(tournament, key=lambda x: x["fitness"])["agent_id"]
+        # Update parameters if provided
+        if n_generations is not None:
+            self.n_generations = n_generations
+        if steps_per_generation is not None:
+            self.steps_per_generation = steps_per_generation
+        if learning_rate is not None:
+            self.agents.learning_rate = learning_rate
         
-        # Find and return the corresponding agent
-        winner = next(a for a in self.population if a.agent_id == winner_id)
-        return winner
+        # Reset generation counter
+        self.generation = 0
+        
+        # Clear history
+        self.fitness_history = []
+        self.lci_history = []
+        self.best_agent_history = []
+        self.best_fitness = float('-inf')
+        self.best_agent_generation = 0
+        
+        # Run for n_generations
+        for gen in range(self.n_generations):
+            # Run a single generation
+            self.run_generation(self.steps_per_generation)
+            
+            # Save current results periodically
+            if gen % 10 == 0 or gen == self.n_generations - 1:
+                self.save_results()
+                self.plot_results()
+        
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        
+        logger.info(f"Simulation completed in {elapsed_time:.2f} seconds")
+        logger.info(f"Best agent found in generation {self.best_agent_generation} with fitness {self.best_fitness:.4f}")
+        
+        # Save final results
+        self.save_results()
+        self.plot_results()
+        
+        return {
+            'fitness_history': self.fitness_history,
+            'lci_history': self.lci_history,
+            'best_agent': {
+                'generation': self.best_agent_generation,
+                'fitness': self.best_fitness
+            },
+            'elapsed_time': elapsed_time
+        }
     
-    def _crossover_and_mutate(self, parent1: LCIAgent, parent2: LCIAgent) -> LCIAgent:
+    def plot_results(self) -> None:
         """
-        Create offspring through crossover and mutation
-        
-        Args:
-            parent1: First parent agent
-            parent2: Second parent agent
-            
-        Returns:
-            New offspring agent
+        Plot the fitness and LCI history.
         """
-        # Crossover LCI parameters
-        # For each parameter, randomly choose from either parent
-        learning_rate = random.choice([parent1.learning_rate, parent2.learning_rate])
-        hidden_size = random.choice([parent1.hidden_size, parent2.hidden_size])
-        n_layers = random.choice([parent1.n_layers, parent2.n_layers])
-        l1_reg = random.choice([parent1.l1_reg, parent2.l1_reg])
-        l2_reg = random.choice([parent1.l2_reg, parent2.l2_reg])
-        dropout_rate = random.choice([parent1.dropout_rate, parent2.dropout_rate])
+        # Create figure with 2 subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
         
-        # Apply mutation with probability mutation_rate
-        if random.random() < self.mutation_rate:
-            # Mutate learning rate (L parameter)
-            learning_rate = max(0.001, min(0.1, learning_rate * random.uniform(0.5, 1.5)))
-            
-        if random.random() < self.mutation_rate:
-            # Mutate hidden size (C parameter)
-            hidden_size = max(4, min(256, int(hidden_size * random.uniform(0.5, 1.5))))
-            
-        if random.random() < self.mutation_rate:
-            # Mutate number of layers (C parameter)
-            n_layers = max(1, min(4, n_layers + random.choice([-1, 0, 1])))
-            
-        if random.random() < self.mutation_rate:
-            # Mutate L1 regularization (I parameter)
-            l1_reg = max(0, min(0.05, l1_reg * random.uniform(0.5, 1.5)))
-            
-        if random.random() < self.mutation_rate:
-            # Mutate L2 regularization (I parameter)
-            l2_reg = max(0, min(0.05, l2_reg * random.uniform(0.5, 1.5)))
-            
-        if random.random() < self.mutation_rate:
-            # Mutate dropout rate (I parameter)
-            dropout_rate = max(0, min(0.8, dropout_rate * random.uniform(0.5, 1.5)))
-        
-        # Create new agent with crossed over and mutated parameters
-        offspring_id = self.generation * self.pop_size + len(self.population)
-        
-        return LCIAgent(
-            input_size=parent1.input_size,
-            learning_rate=learning_rate,
-            hidden_size=hidden_size,
-            n_layers=n_layers,
-            l1_reg=l1_reg,
-            l2_reg=l2_reg,
-            dropout_rate=dropout_rate,
-            agent_id=offspring_id
-        )
-    
-    def run_simulation(self, n_generations: int = 50, steps_per_eval: int = 100):
-        """
-        Run the full evolutionary simulation
-        
-        Args:
-            n_generations: Number of generations to simulate
-            steps_per_eval: Number of steps per fitness evaluation
-        """
-        simulation_start_time = datetime.now()
-        logger.info(f"Starting simulation with {n_generations} generations")
-        
-        for gen in tqdm(range(n_generations), desc="Generation"):
-            # Evaluate fitness
-            fitness_results = self.evaluate_fitness(steps_per_eval)
-            
-            # Calculate statistics
-            avg_fitness = np.mean([r["fitness"] for r in fitness_results])
-            max_fitness = np.max([r["fitness"] for r in fitness_results])
-            avg_lci_balance = np.mean([r["lci_balance"] for r in fitness_results])
-            
-            logger.info(f"Generation {gen}: Avg Fitness = {avg_fitness:.2f}, Max Fitness = {max_fitness:.2f}, Avg LCI Balance = {avg_lci_balance:.2f}")
-            
-            # Select and reproduce
-            self.selection_and_reproduction(fitness_results)
-            
-            # Save intermediate results every 10 generations
-            if gen % 10 == 0 or gen == n_generations - 1:
-                self.save_results(f"gen_{gen}")
-        
-        simulation_end_time = datetime.now()
-        simulation_duration = simulation_end_time - simulation_start_time
-        logger.info(f"Simulation completed in {simulation_duration}")
-    
-    def plot_results(self, filename: str = "lci_simulation_results.png"):
-        """
-        Generate plots of simulation results
-        
-        Args:
-            filename: File name for the plot image
-        """
-        if not self.fitness_history:
-            logger.warning("No fitness history available for plotting")
-            return
-            
-        filepath = os.path.join(self.output_dir, filename)
-        
-        plt.figure(figsize=(15, 10))
+        # Extract data for plotting
+        generations = list(range(1, len(self.fitness_history) + 1))
+        mean_fitness = [gen['mean'] for gen in self.fitness_history]
+        max_fitness = [gen['max'] for gen in self.fitness_history]
+        mean_lci = [gen['mean'] for gen in self.lci_history]
+        max_lci = [gen['max'] for gen in self.lci_history]
+        alive_counts = [gen['alive_count'] for gen in self.lci_history]
         
         # Plot fitness history
-        plt.subplot(2, 2, 1)
-        plt.plot(self.fitness_history)
-        plt.title('Average Fitness Over Generations')
-        plt.xlabel('Generation')
-        plt.ylabel('Fitness')
+        ax1.plot(generations, mean_fitness, label='Mean Fitness', color='blue')
+        ax1.plot(generations, max_fitness, label='Max Fitness', color='green')
+        ax1.set_title('Fitness History')
+        ax1.set_xlabel('Generation')
+        ax1.set_ylabel('Fitness')
+        ax1.legend()
+        ax1.grid(True)
         
-        # Plot LCI parameters over time
-        plt.subplot(2, 2, 2)
-        L_values, C_values, I_values = zip(*self.lci_history)
-        plt.plot(L_values, label='L')
-        plt.plot(C_values, label='C')
-        plt.plot(I_values, label='I')
-        plt.title('LCI Parameters Over Generations')
-        plt.xlabel('Generation')
-        plt.ylabel('Value')
-        plt.legend()
+        # Plot LCI history
+        ax2.plot(generations, mean_lci, label='Mean LCI', color='blue')
+        ax2.plot(generations, max_lci, label='Max LCI', color='green')
         
-        # Plot final population in LCI space
-        plt.subplot(2, 2, 3)
-        L = [agent.lci_params["L"] for agent in self.population]
-        C = [agent.lci_params["C"] for agent in self.population]
-        I = [agent.lci_params["I"] for agent in self.population]
+        # Create a second y-axis for alive counts
+        ax2_alive = ax2.twinx()
+        ax2_alive.plot(generations, alive_counts, label='Alive Agents', color='red', linestyle='--')
+        ax2_alive.set_ylabel('Alive Agents Count', color='red')
         
-        plt.scatter(L, C, c=I, cmap='viridis', alpha=0.7)
-        plt.colorbar(label='I Value')
-        plt.title('Final Population in L-C Space')
-        plt.xlabel('L (Losslessness)')
-        plt.ylabel('C (Compression)')
+        ax2.set_title('LCI History and Alive Agents')
+        ax2.set_xlabel('Generation')
+        ax2.set_ylabel('LCI')
         
-        # Plot final population LCI balance distribution
-        plt.subplot(2, 2, 4)
-        balance_values = [agent.get_lci_balance() for agent in self.population]
-        plt.hist(balance_values, bins=20)
-        plt.title('LCI Balance Distribution')
-        plt.xlabel('LCI Balance')
-        plt.ylabel('Count')
+        # Combine legends
+        lines1, labels1 = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_alive.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2)
         
+        ax2.grid(True)
+        
+        # Adjust layout and save figure
         plt.tight_layout()
-        plt.savefig(filepath)
-        logger.info(f"Saved plot to {filepath}")
-        
-    def save_results(self, identifier: str = "final"):
+        plt.savefig(f"{self.output_dir}/evolution_history.png")
+        plt.close()
+    
+    def save_results(self) -> None:
         """
-        Save simulation results to files
-        
-        Args:
-            identifier: Identifier to append to file names
+        Save the results to a JSON file.
         """
-        # Create output directory if it doesn't exist
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Save best agent
-        if self.best_agent_history:
-            best_agent_ever = max(self.best_agent_history, key=lambda x: x["fitness"])
-            best_agent_id = best_agent_ever["agent_id"]
-            try:
-                best_agent = next(a for a in self.population if a.agent_id == best_agent_id)
-                model_path = os.path.join(self.output_dir, f"best_agent_{identifier}.pt")
-                best_agent.save_model(model_path)
-                logger.info(f"Saved best agent model to {model_path}")
-            except StopIteration:
-                logger.warning(f"Best agent {best_agent_id} not found in current population")
-        
-        # Save statistics
-        stats = {
-            "fitness_history": self.fitness_history,
-            "lci_history": self.lci_history,
-            "best_agent_history": self.best_agent_history,
-            "env_config": self.env_config,
-            "pop_size": self.pop_size,
-            "mutation_rate": self.mutation_rate,
-            "tournament_size": self.tournament_size,
-            "elitism": self.elitism,
-            "generation": self.generation,
+        results = {
+            'parameters': {
+                'pop_size': self.pop_size,
+                'mutation_rate': self.mutation_rate,
+                'tournament_size': self.tournament_size,
+                'elitism': self.elitism,
+                'n_states': self.n_states,
+                'n_actions': self.n_actions,
+                'n_generations': self.n_generations,
+                'steps_per_generation': self.steps_per_generation
+            },
+            'fitness_history': self.fitness_history,
+            'lci_history': self.lci_history,
+            'best_agent_history': self.best_agent_history
         }
         
-        stats_path = os.path.join(self.output_dir, f"stats_{identifier}.json")
-        with open(stats_path, 'w') as f:
-            json.dump(stats, f, default=lambda x: str(x) if isinstance(x, np.ndarray) else x)
-        logger.info(f"Saved statistics to {stats_path}")
-        
-        # Generate and save plots
-        self.plot_results(f"lci_results_{identifier}.png") 
+        with open(f"{self.output_dir}/results.json", 'w') as f:
+            json.dump(results, f, indent=2) 

@@ -114,7 +114,12 @@ def create_default_config() -> Dict[str, Any]:
     config = {
         "environment": {
             "n_states": 20,
-            "sparse_transitions": True,
+            "n_actions": 2,
+            "volatility": 0.2,
+            "reward_volatility": 0.1,
+            "penalty_factor": 0.05,
+            "reward_min": 0.0,
+            "reward_max": 1.0,
             "seed": 42
         },
         "evolution": {
