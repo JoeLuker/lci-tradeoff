@@ -12,14 +12,22 @@ hidden_size: 64 # Size of hidden layers in the neural network
 n_layers: 2 # Number of hidden layers
 dropout_rate: 0.1 # Dropout rate for regularization
 
+# Energy parameters
+energy_init: 10.0 # Initial energy level
+energy_cost_predict: 0.01 # Energy cost for prediction
+energy_cost_learn: 0.05 # Energy cost for learning
+energy_recovery: 0.02 # Energy recovery per step
+learn_prob: 0.1 # Probability of learning each step
+evolvable_energy: true # Whether to use evolvable energy parameters
+
 # Evolution parameters
 mutation_rate: 0.1 # Probability of mutation during reproduction
 tournament_size: 5 # Number of agents competing in tournament selection
 elitism: 0.1 # Fraction of population preserved via elitism
 
 # Training parameters
-n_generations: 50 # Number of generations to run
-steps_per_generation: 200 # Environment steps per generation
+n_generations: 20 # Number of generations to run
+steps_per_generation: 100 # Environment steps per generation
 learning_rate: 0.001 # Learning rate for neural network updates
 
 # Output parameters

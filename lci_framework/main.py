@@ -59,6 +59,10 @@ def run_simulation(config):
         mutation_rate=config.get('mutation_rate', 0.1),
         tournament_size=config.get('tournament_size', 5),
         elitism=config.get('elitism', 0.1),
+        energy_init=config.get('energy_init', 10.0),
+        energy_cost_predict=config.get('energy_cost_predict', 0.01),
+        energy_cost_learn=config.get('energy_cost_learn', 0.05),
+        energy_recovery=config.get('energy_recovery', 0.1),
         output_dir=output_dir,
         device=device
     )
@@ -83,7 +87,7 @@ def main(args=None):
         parser = argparse.ArgumentParser(description='Run the LCI framework')
         parser.add_argument('--config', type=str, default='config/lci_config.yaml',
                             help='Path to configuration file')
-        parser.add_argument('--log-level', type=str, default='INFO',
+        parser.add_argument('--log-level', type=str, default='DEBUG',
                             choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                             help='Logging level')
         parser.add_argument('--output', type=str, 

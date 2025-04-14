@@ -147,17 +147,11 @@ class VectorizedMarkovEnvironment:
             actions = actions.argmax(dim=1)
         
         # Get transition probabilities for current states and chosen actions
-        # Shape: [pop_size, n_states]
-        transition_probs = torch.stack(
-            [self.transition_matrix[self.current_states[i], actions[i]] for i in range(self.pop_size)]
-        )
+        # Use advanced indexing to get all transition probabilities at once
+        transition_probs = self.transition_matrix[self.current_states, actions]
         
-        # Sample next states based on transition probabilities
-        next_states = torch.zeros(self.pop_size, dtype=torch.long, device=self.device)
-        
-        # Sample from multinomial distribution for each agent
-        for i in range(self.pop_size):
-            next_states[i] = torch.multinomial(transition_probs[i], 1).item()
+        # Sample next states based on transition probabilities - fully vectorized
+        next_states = torch.multinomial(transition_probs, 1).squeeze(-1)
         
         # Get rewards for current states and chosen actions
         rewards = self.reward_matrix[self.current_states, actions]
@@ -182,6 +176,7 @@ class VectorizedMarkovEnvironment:
         
         Args:
             action_probs: Tensor of action probabilities with shape [pop_size, n_actions]
+                         or action indices with shape [pop_size]
             
         Returns:
             observations: New observations (one-hot encoded states) [pop_size, n_states]
@@ -191,33 +186,34 @@ class VectorizedMarkovEnvironment:
         """
         # Convert to action indices if needed
         if action_probs.dim() > 1:
-            actions = action_probs.argmax(dim=1)
+            # Make sure the actions are valid by constraining to valid range
+            actions = torch.clamp(action_probs.argmax(dim=1), 0, self.n_actions - 1)
         else:
-            actions = action_probs
+            # If already indices, ensure they're valid
+            actions = torch.clamp(action_probs, 0, self.n_actions - 1)
         
-        # Get transition probabilities for current states and chosen actions
-        next_states = torch.zeros_like(self.current_states)
-        rewards = torch.zeros(self.pop_size, device=self.device)
+        # Ensure current states array has the right shape
+        if self.current_states.shape[0] != self.pop_size:
+            # If we have the wrong number of states (e.g., if some agents died),
+            # reinitialize the states array to the correct size
+            self.current_states = torch.randint(0, self.n_states, (self.pop_size,), device=self.device)
+            logger.warning(f"Fixed state dimensions mismatch: reset to {self.pop_size} states")
+            
+        # Ensure valid state indices
+        current_states = torch.clamp(self.current_states, 0, self.n_states - 1)
         
-        # Process each agent individually to avoid tensor shape issues
-        for i in range(self.pop_size):
-            # Get transition probabilities for this agent
-            trans_probs = self.transition_matrix[self.current_states[i], actions[i]]
-            
-            # Ensure valid probabilities
-            if trans_probs.sum() <= 0:
-                # If probabilities are invalid, choose a random next state
-                next_states[i] = torch.randint(0, self.n_states, (1,), device=self.device)
-            else:
-                # Ensure probabilities sum to 1
-                trans_probs = torch.clamp(trans_probs, min=1e-6)
-                trans_probs = trans_probs / trans_probs.sum()
-                
-                # Sample next state
-                next_states[i] = torch.multinomial(trans_probs, 1).item()
-            
-            # Get reward
-            rewards[i] = self.reward_matrix[self.current_states[i], actions[i]]
+        # Get transition probabilities for current states and chosen actions - vectorized
+        trans_probs = self.transition_matrix[current_states, actions]
+        
+        # Ensure valid probabilities
+        trans_probs = torch.clamp(trans_probs, min=1e-6)
+        trans_probs = trans_probs / trans_probs.sum(dim=1, keepdim=True)
+        
+        # Sample next states in a fully vectorized way
+        next_states = torch.multinomial(trans_probs, 1).squeeze(-1)
+        
+        # Get rewards (vectorized)
+        rewards = self.reward_matrix[current_states, actions]
         
         # Update current states
         self.current_states = next_states
