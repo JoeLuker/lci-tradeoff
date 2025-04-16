@@ -1,7 +1,7 @@
 # LCI Framework Configuration
 
 # Population parameters
-pop_size: 100 # Number of agents in the population
+pop_size: 1000 # Number of agents in the population
 
 # Environment parameters
 n_states: 16 # Number of states in the Markov environment

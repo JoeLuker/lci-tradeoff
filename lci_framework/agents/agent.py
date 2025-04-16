@@ -1,11 +1,8 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+import mlx.core as mx
+import mlx.nn as nn
 import logging
 import os
 from typing import Dict, List, Tuple, Optional, Union, Any
-
 logger = logging.getLogger(__name__)
 
 class PopulationLinear(nn.Module):
@@ -17,40 +14,26 @@ class PopulationLinear(nn.Module):
                  pop_size: int, 
                  in_features: int, 
                  out_features: int, 
-                 bias: bool = True,
-                 device: Optional[torch.device] = None):
+                 bias: bool = True):
         super().__init__()
-        
-        # Set up device
-        if device is not None:
-            self.device = device
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
-            logger.warning("Using CPU for tensor operations, which may be slow")
         
         # Initialize weights for the entire population
         # Shape: [pop_size, out_features, in_features]
-        self.weight = nn.Parameter(
-            torch.randn(pop_size, out_features, in_features, device=self.device) * 0.02
-        )
+        self.weight = mx.random.normal(
+            (pop_size, out_features, in_features)
+        ) * 0.02
         
         if bias:
             # Shape: [pop_size, out_features]
-            self.bias = nn.Parameter(
-                torch.zeros(pop_size, out_features, device=self.device)
-            )
+            self.bias = mx.zeros((pop_size, out_features))
         else:
-            self.register_parameter('bias', None)
+            self.bias = None
         
         self.in_features = in_features
         self.out_features = out_features
         self.pop_size = pop_size
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: mx.array) -> mx.array:
         """
         Forward pass through the population linear layer.
         
@@ -60,36 +43,64 @@ class PopulationLinear(nn.Module):
         Returns:
             Output tensor with shape [pop_size, batch_size, out_features]
         """
-        # Make sure x is on the right device
-        if x.device != self.device:
-            x = x.to(self.device)
-            
+        # Debug input
+        logger.debug(f"PopulationLinear input: type={type(x)}, shape={getattr(x, 'shape', None)}")
+        
         # Handle different input shapes
-        if x.dim() == 2:  # [pop_size, in_features] - single sample case
-            # Reshape for bmm: [pop_size, 1, in_features]
-            x = x.unsqueeze(1)
+        if x.ndim == 2:  # [pop_size, in_features] - single sample case
+            logger.debug("PopulationLinear 2D input case")
             
-            # Batched matrix multiplication: [pop_size, 1, in_features] @ [pop_size, in_features, out_features]
-            output = torch.bmm(x, self.weight.transpose(1, 2))
+            # Reshape for matmul: [pop_size, 1, in_features]
+            x_reshaped = mx.expand_dims(x, 1)
+            logger.debug(f"After expand_dims: type={type(x_reshaped)}, shape={getattr(x_reshaped, 'shape', None)}")
+            
+            # Get transposed weights
+            transposed_weight = mx.transpose(self.weight, (0, 2, 1))
+            logger.debug(f"Transposed weight: type={type(transposed_weight)}, shape={getattr(transposed_weight, 'shape', None)}")
+            
+            # Batched matrix multiplication
+            output = mx.matmul(x_reshaped, transposed_weight)
+            logger.debug(f"After matmul: type={type(output)}, shape={getattr(output, 'shape', None)}")
             
             # Reshape to remove singleton dimension: [pop_size, out_features]
-            output = output.squeeze(1)
+            output = mx.squeeze(output, 1)
+            logger.debug(f"After squeeze: type={type(output)}, shape={getattr(output, 'shape', None)}")
             
             # Add bias
             if self.bias is not None:
                 output = output + self.bias
+                logger.debug(f"After bias: type={type(output)}, shape={getattr(output, 'shape', None)}")
                 
-        elif x.dim() == 3:  # [pop_size, batch_size, in_features] - batch case
+        elif x.ndim == 3:  # [pop_size, batch_size, in_features] - batch case
+            logger.debug("PopulationLinear 3D input case")
+            
+            # Get transposed weights
+            transposed_weight = mx.transpose(self.weight, (0, 2, 1))
+            logger.debug(f"Transposed weight: type={type(transposed_weight)}, shape={getattr(transposed_weight, 'shape', None)}")
+            
             # Batched matrix multiplication
-            output = torch.matmul(x, self.weight.transpose(1, 2))
+            output = mx.matmul(x, transposed_weight)
+            logger.debug(f"After matmul: type={type(output)}, shape={getattr(output, 'shape', None)}")
             
             # Add bias
             if self.bias is not None:
-                output = output + self.bias.unsqueeze(1)
+                bias_expanded = mx.expand_dims(self.bias, 1)
+                logger.debug(f"Expanded bias: type={type(bias_expanded)}, shape={getattr(bias_expanded, 'shape', None)}")
+                output = output + bias_expanded
+                logger.debug(f"After bias: type={type(output)}, shape={getattr(output, 'shape', None)}")
                 
         else:
-            raise ValueError(f"Expected input tensor with 2 or 3 dimensions, got {x.dim()}")
-            
+            raise ValueError(f"Expected input tensor with 2 or 3 dimensions, got {x.ndim}")
+        
+        # Final check
+        if not isinstance(output, mx.array):
+            logger.error(f"PopulationLinear returning non-array type: {type(output)}")
+            if isinstance(output, tuple):
+                logger.warning("Converting tuple to array")
+                # Force conversion of tuple to array
+                output = mx.array(output[0] if len(output) > 0 else 0.0)
+        
+        logger.debug(f"PopulationLinear output: type={type(output)}, shape={getattr(output, 'shape', None)}")
         return output
 
 class NeuralPopulation(nn.Module):
@@ -103,8 +114,7 @@ class NeuralPopulation(nn.Module):
                  input_size: int, 
                  hidden_size: int = 64, 
                  n_layers: int = 2,
-                 dropout_rate: float = 0.1,
-                 device: Optional[torch.device] = None):
+                 dropout_rate: float = 0.1):
         """
         Initialize a population of neural networks.
         
@@ -114,7 +124,6 @@ class NeuralPopulation(nn.Module):
             hidden_size: Size of the hidden layers
             n_layers: Number of hidden layers
             dropout_rate: Dropout probability
-            device: Device for computation (defaults to MPS or CUDA)
         """
         super().__init__()
         
@@ -124,44 +133,24 @@ class NeuralPopulation(nn.Module):
         self.n_layers = n_layers
         self.dropout_rate = dropout_rate
         
-        # Set up device (MPS or CUDA only)
-        if device is not None:
-            self.device = device
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-            logger.info("Using MPS device for neural population")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            logger.info("Using CUDA device for neural population")
-        else:
-            raise RuntimeError("No GPU available. This implementation requires GPU acceleration.")
-        
         # Create layers
-        self.layers = nn.ModuleList([
+        self.layers = [
             PopulationLinear(
                 pop_size=pop_size, 
                 in_features=input_size if i == 0 else hidden_size, 
-                out_features=hidden_size,
-                device=self.device
+                out_features=hidden_size
             )
             for i in range(n_layers)
-        ])
+        ]
         
         # Output layer
         self.output_layer = PopulationLinear(
             pop_size=pop_size, 
             in_features=hidden_size, 
-            out_features=1,  # Single output per network
-            device=self.device
+            out_features=1  # Single output per network
         )
-        
-        # Dropout layer
-        self.dropout = nn.Dropout(dropout_rate)
-        
-        # Move model to the device
-        self.to(self.device)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: mx.array) -> mx.array:
         """
         Forward pass through the population of neural networks.
         
@@ -175,82 +164,106 @@ class NeuralPopulation(nn.Module):
         Returns:
             Output tensor with shape [pop_size, 1] or [batch_size, pop_size, 1]
         """
-        # Check if input is on the correct device
-        if x.device != self.device:
-            x = x.to(self.device)
-        
         # Forward pass through hidden layers
         for layer in self.layers:
-            x = F.relu(layer(x))
-            x = self.dropout(x)
+            x = nn.relu(layer(x))
+            # Apply dropout if in training mode
+            if self.dropout_rate > 0:
+                mask = mx.random.uniform(x.shape) > self.dropout_rate
+                x = x * mask * (1.0 / (1.0 - self.dropout_rate))
         
         # Forward pass through output layer
         output = self.output_layer(x)
         
         return output
     
-    def l1_loss(self) -> torch.Tensor:
+    def l1_loss(self) -> mx.array:
         """
         Calculate L1 regularization loss for all parameters.
         
         Returns:
             L1 regularization loss
         """
-        l1_reg = torch.tensor(0.0, device=self.device)
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                l1_reg += param.abs().sum()
+        l1_reg = 0.0
+        
+        # Sum L1 norms of all weights
+        for layer in self.layers:
+            l1_reg += mx.sum(mx.abs(layer.weight))
+            if layer.bias is not None:
+                l1_reg += mx.sum(mx.abs(layer.bias))
+        
+        # Add output layer parameters
+        l1_reg += mx.sum(mx.abs(self.output_layer.weight))
+        if self.output_layer.bias is not None:
+            l1_reg += mx.sum(mx.abs(self.output_layer.bias))
+        
         return l1_reg
     
-    def l2_loss(self) -> torch.Tensor:
+    def l2_loss(self) -> mx.array:
         """
         Calculate L2 regularization loss for all parameters.
         
         Returns:
             L2 regularization loss
         """
-        l2_reg = torch.tensor(0.0, device=self.device)
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                l2_reg += (param ** 2).sum()
+        l2_reg = 0.0
+        
+        # Sum squared norms of all weights
+        for layer in self.layers:
+            l2_reg += mx.sum(mx.square(layer.weight))
+            if layer.bias is not None:
+                l2_reg += mx.sum(mx.square(layer.bias))
+        
+        # Add output layer parameters
+        l2_reg += mx.sum(mx.square(self.output_layer.weight))
+        if self.output_layer.bias is not None:
+            l2_reg += mx.sum(mx.square(self.output_layer.bias))
+        
         return l2_reg
     
     def save_population(self, path: str) -> None:
         """
-        Save the population state.
+        Save the population parameters to disk.
         
         Args:
-            path: Path to save the population state
+            path: Path to save the parameters
         """
-        state_dict = self.state_dict()
-        torch.save({
-            'state_dict': state_dict,
-            'pop_size': self.pop_size,
-            'input_size': self.input_size,
-            'hidden_size': self.hidden_size,
-            'n_layers': self.n_layers,
-            'dropout_rate': self.dropout_rate
-        }, path)
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # For each parameter, save it separately
+        for i, layer in enumerate(self.layers):
+            mx.save(f"{path}_layer_{i}_weight", layer.weight)
+            if layer.bias is not None:
+                mx.save(f"{path}_layer_{i}_bias", layer.bias)
+        
+        # Save output layer parameters
+        mx.save(f"{path}_output_weight", self.output_layer.weight)
+        if self.output_layer.bias is not None:
+            mx.save(f"{path}_output_bias", self.output_layer.bias)
     
     def load_population(self, path: str) -> None:
         """
-        Load the population state.
+        Load the population parameters from disk.
         
         Args:
-            path: Path to load the population state from
+            path: Path to load parameters from
         """
-        checkpoint = torch.load(path, map_location=self.device)
-        self.load_state_dict(checkpoint['state_dict'])
-        self.pop_size = checkpoint['pop_size']
-        self.input_size = checkpoint['input_size']
-        self.hidden_size = checkpoint['hidden_size']
-        self.n_layers = checkpoint['n_layers']
-        self.dropout_rate = checkpoint['dropout_rate']
+        # Load hidden layer parameters
+        for i, layer in enumerate(self.layers):
+            layer.weight = mx.load(f"{path}_layer_{i}_weight")
+            if layer.bias is not None:
+                layer.bias = mx.load(f"{path}_layer_{i}_bias")
+        
+        # Load output layer parameters
+        self.output_layer.weight = mx.load(f"{path}_output_weight")
+        if self.output_layer.bias is not None:
+            self.output_layer.bias = mx.load(f"{path}_output_bias")
 
 class TensorLCIAgent:
     """
-    Tensor-based implementation of the LCI agent that manages a population
-    of agents that can be processed in parallel using tensor operations.
+    A vectorized implementation of the LCI agent using MLX arrays.
+    This implementation can process an entire population of agents in parallel.
     """
     
     def __init__(self, 
@@ -267,565 +280,423 @@ class TensorLCIAgent:
                  l1_reg: float = 0.001,
                  l2_reg: float = 0.001,
                  learn_prob: float = 0.1,
-                 evolvable_energy: bool = True,
-                 device: Optional[torch.device] = None):
+                 evolvable_energy: bool = True):
         """
-        Initialize the tensor LCI agent.
+        Initialize a population of LCI agents.
         
         Args:
             pop_size: Number of agents in the population
-            input_size: Size of the input features
+            input_size: Size of the input (state) vector
             energy_cost_predict: Energy cost for making a prediction
             energy_cost_learn: Energy cost for learning
             energy_init: Initial energy level
-            energy_recovery: Energy recovery rate
+            energy_recovery: Energy recovery rate per step
             learning_rate: Learning rate for neural network updates
-            hidden_size: Size of the hidden layers
-            n_layers: Number of hidden layers
+            hidden_size: Size of hidden layers in neural networks
+            n_layers: Number of hidden layers in neural networks
             dropout_rate: Dropout probability
             l1_reg: L1 regularization strength
             l2_reg: L2 regularization strength
-            learn_prob: Probability of learning on each step
-            evolvable_energy: Whether to use evolvable energy parameters
-            device: Device for computation (defaults to MPS or CUDA)
+            learn_prob: Learning probability
+            evolvable_energy: Whether energy parameters can evolve
         """
-        # Set up device (MPS or CUDA only)
-        if device is not None:
-            self.device = device
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-            logger.info("Using MPS device for LCI agents")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            logger.info("Using CUDA device for LCI agents")
-        else:
-            raise RuntimeError("No GPU available. This implementation requires GPU acceleration.")
-        
         self.pop_size = pop_size
         self.input_size = input_size
-        self.evolvable_energy = evolvable_energy
         
-        # Fixed energy parameters (used as base values)
-        self.base_energy_cost_predict = energy_cost_predict
-        self.base_energy_cost_learn = energy_cost_learn
-        self.base_energy_init = energy_init
-        self.base_energy_recovery = energy_recovery
-        self.base_learn_prob = learn_prob
-        
-        # Create evolvable energy genes for each agent
-        if evolvable_energy:
-            # Initialize with small random variations around base values
-            # Each agent gets its own energy parameters
-            self.energy_efficiency = torch.ones(pop_size, device=self.device) + 0.1 * torch.randn(pop_size, device=self.device)
-            self.learn_probability = torch.full((pop_size,), learn_prob, device=self.device) + 0.02 * torch.randn(pop_size, device=self.device)
-            self.recovery_rate = torch.full((pop_size,), energy_recovery, device=self.device) + 0.005 * torch.randn(pop_size, device=self.device)
-            
-            # Ensure valid values
-            self.energy_efficiency = torch.clamp(self.energy_efficiency, min=0.5, max=1.5)
-            self.learn_probability = torch.clamp(self.learn_probability, min=0.01, max=0.3)
-            self.recovery_rate = torch.clamp(self.recovery_rate, min=0.005, max=0.1)
-            
-            # Set up energy parameters based on genes
-            self.energy_cost_predict = torch.full((pop_size,), energy_cost_predict, device=self.device) / self.energy_efficiency
-            self.energy_cost_learn = torch.full((pop_size,), energy_cost_learn, device=self.device) / self.energy_efficiency
-            self.energy_recovery = self.recovery_rate
-        else:
-            # Fixed parameters for all agents (backward compatibility)
-            self.energy_cost_predict = energy_cost_predict
-            self.energy_cost_learn = energy_cost_learn
-            self.energy_init = energy_init
-            self.energy_recovery = energy_recovery
-            self.learn_probability = learn_prob
-        
-        self.learning_rate = learning_rate
-        self.l1_reg = l1_reg
-        self.l2_reg = l2_reg
-        
-        # Initialize neural population
-        self.model = NeuralPopulation(
+        # Create neural network population
+        self.policy_net = NeuralPopulation(
             pop_size=pop_size,
             input_size=input_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
-            dropout_rate=dropout_rate,
-            device=self.device
+            dropout_rate=dropout_rate
         )
         
-        # Initialize energy levels for all agents
-        self.energy = torch.full((pop_size,), energy_init, device=self.device)
+        # Initialize energy parameters
+        if evolvable_energy:
+            self.energy_cost_predict = mx.ones((pop_size, 1)) * energy_cost_predict
+            self.energy_cost_learn = mx.ones((pop_size, 1)) * energy_cost_learn
+            self.energy_recovery = mx.ones((pop_size, 1)) * energy_recovery
+        else:
+            self.energy_cost_predict = energy_cost_predict
+            self.energy_cost_learn = energy_cost_learn
+            self.energy_recovery = energy_recovery
         
-        # Initialize optimizer
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.energy_init = energy_init
+        self.evolvable_energy = evolvable_energy
+        
+        # Current energy levels
+        self.energy = mx.ones((pop_size,)) * energy_init
+        
+        # Learning parameters
+        self.learning_rate = learning_rate
+        self.l1_reg = l1_reg
+        self.l2_reg = l2_reg
+        self.learn_prob = learn_prob
         
         # Tracking variables
-        self.step_count = torch.zeros(pop_size, device=self.device)
-        self.warned_low_energy = torch.zeros(pop_size, dtype=torch.bool, device=self.device)
+        self.cumulative_reward = mx.zeros((pop_size,))
+        self.step_count = mx.zeros((pop_size,), dtype=mx.int32)
+        self.lci_values = mx.zeros((pop_size,))
+        self.learn_decisions = mx.zeros((pop_size,), dtype=mx.int32)
         
-    def predict(self, observation: Union[torch.Tensor, np.ndarray], alive_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Make a prediction based on observation.
+        # Create mask to track alive agents
+        self.alive_mask = mx.ones((pop_size,), dtype=mx.bool_)
         
-        Args:
-            observation: Single observation with shape [input_size] or 
-                         batch of observations with shape [batch_size, input_size]
-            alive_mask: Optional tensor indicating which agents are alive [pop_size]
-                      
-        Returns:
-            Tensor of probabilities for each action with shape [pop_size, 1] or [batch_size, pop_size, 1]
-        """
-        # Check energy level
-        has_energy = self.energy >= self.energy_cost_predict
-        
-        # Apply alive mask if provided - only alive agents can have energy
-        if alive_mask is not None:
-            has_energy = has_energy & alive_mask
-            
-        # Convert observation to tensor if it's a numpy array
-        if isinstance(observation, np.ndarray):
-            observation = torch.tensor(observation, dtype=torch.float32, device=self.device)
-        
-        # Ensure the observation is on the right device
-        observation = observation.to(self.device)
-        
-        # Handle single observation vs batch differently
-        if observation.dim() == 1:  # Single observation
-            # Apply energy cost to agents with sufficient energy
-            if self.evolvable_energy:
-                self.energy[has_energy] -= self.energy_cost_predict[has_energy]
-            else:
-                self.energy[has_energy] -= self.energy_cost_predict
-            
-            # Forward pass
-            with torch.no_grad():
-                # Initialize output with zeros for all agents
-                output = torch.zeros((self.pop_size, 1), device=self.device)
-                
-                # Only get predictions for agents with energy
-                if has_energy.any():
-                    # Expand observation for all agents regardless of energy
-                    obs_expanded = observation.expand(self.pop_size, -1)
-                    
-                    # Run prediction for all agents (the inactive ones won't matter)
-                    predictions = self.model(obs_expanded)
-                    
-                    # Apply energy mask to predictions
-                    output = torch.where(
-                        has_energy.unsqueeze(1),
-                        torch.sigmoid(predictions),
-                        output
-                    )
-                
-                return output
-        
-        elif observation.dim() == 2:  # Batch of observations
-            batch_size = observation.size(0)
-            
-            # Apply energy cost to agents with sufficient energy
-            if self.evolvable_energy:
-                self.energy[has_energy] -= self.energy_cost_predict[has_energy]
-            else:
-                self.energy[has_energy] -= self.energy_cost_predict
-            
-            # Forward pass
-            with torch.no_grad():
-                # Initialize output tensor with zeros
-                output = torch.zeros((batch_size, self.pop_size, 1), device=self.device)
-                
-                # Only get predictions for agents with energy
-                if has_energy.any():
-                    # Create energy mask for batched processing
-                    energy_mask = has_energy.unsqueeze(0).expand(batch_size, -1)
-                    
-                    # Expand observation for all agents regardless of energy
-                    # [batch_size, input_size] -> [batch_size, pop_size, input_size]
-                    obs_expanded = observation.unsqueeze(1).expand(-1, self.pop_size, -1)
-                    
-                    # Forward pass through model
-                    predictions = self.model(obs_expanded)
-                    
-                    # Apply energy mask to output
-                    output = torch.where(
-                        energy_mask.unsqueeze(-1),
-                        torch.sigmoid(predictions),
-                        output
-                    )
-                
-                return output
-        else:
-            raise ValueError(f"Observation must be 1D or 2D, got {observation.dim()}D")
+        # Training step counter
+        self.train_step = 0
     
-    def learn(self, observation: torch.Tensor, reward: torch.Tensor, alive_mask: Optional[torch.Tensor] = None) -> None:
+    def predict(self, observation: mx.array, alive_mask: Optional[mx.array] = None) -> mx.array:
         """
-        Learn from observation and reward.
+        Make a prediction for all agents in the population.
         
         Args:
-            observation: Observation tensor with shape [input_size], [pop_size, input_size], 
-                         or [batch_size, input_size]
-            reward: Reward tensor with shape [1], [pop_size], or [batch_size]
-            alive_mask: Optional tensor indicating which agents are alive [pop_size]
+            observation: Input observation with shape [pop_size, input_size]
+                         or [batch_size, pop_size, input_size]
+            alive_mask: Mask of alive agents, shape [pop_size] or None
+                       If None, uses the internal alive_mask
+                
+        Returns:
+            Action values with shape [pop_size, 1] or [batch_size, pop_size, 1]
         """
-        # Check energy level
-        has_energy = self.energy >= self.energy_cost_learn
+        # Use the internal alive mask if not provided
+        if alive_mask is None:
+            alive_mask = self.alive_mask
         
-        # Apply alive mask if provided
-        if alive_mask is not None:
-            has_energy = has_energy & alive_mask
-            
-        # If no agent has enough energy, return early
-        if not has_energy.any():
-            return
-        
-        # Ensure tensors are on the correct device
-        observation = observation.to(self.device)
-        reward = reward.to(self.device)
-        
-        # Single observation/reward case
-        if observation.dim() == 1:
-            # Create a batch with the full population
-            obs_expanded = observation.expand(self.pop_size, -1)
-            reward_expanded = reward.expand(self.pop_size) if not isinstance(reward, float) else torch.full((self.pop_size,), reward, device=self.device)
-            
-            # Forward pass - only for agents with energy
-            self.optimizer.zero_grad()
-            with torch.set_grad_enabled(True):
-                # Get predictions for all agents
-                predictions = self.model(obs_expanded)
-                predictions = torch.sigmoid(predictions)
-                
-                # Make target tensor
-                target = reward_expanded.unsqueeze(-1)
-                
-                # Calculate loss only for agents with energy
-                # Create a mask to zero out loss for agents without energy
-                mask = has_energy.unsqueeze(-1).to(dtype=predictions.dtype)
-                
-                # Element-wise loss
-                error = predictions - target
-                loss = (error * error) * mask  # Squared error with mask
-                
-                # Calculate prediction error (for energy cost scaling)
-                prediction_error = torch.abs(error).squeeze(-1)
-                
-                # Apply energy cost proportional to prediction error (for agents with energy)
-                if self.evolvable_energy:
-                    # Scale energy cost by prediction error and energy efficiency
-                    energy_cost = torch.zeros_like(self.energy)
-                    energy_cost[has_energy] = self.energy_cost_learn[has_energy] * (0.5 + 0.5 * prediction_error[has_energy])
-                    # Apply energy cost
-                    self.energy -= energy_cost
-                else:
-                    # Scale energy cost by prediction error
-                    energy_cost = self.energy_cost_learn * (0.5 + 0.5 * prediction_error.mean().item())
-                    # Apply energy cost
-                    self.energy[has_energy] -= energy_cost
-                
-                # Mean loss for agents with energy
-                loss = loss.sum() / (mask.sum() + 1e-8)
-                
-                # Add regularization
-                if self.l1_reg > 0:
-                    loss += self.l1_reg * self.model.l1_loss()
-                if self.l2_reg > 0:
-                    loss += self.l2_reg * self.model.l2_loss()
-                
-                # Backward pass and optimization
-                loss.backward()
-                self.optimizer.step()
-                
-                # Increment step count for agents with energy
-                self.step_count[has_energy] += 1
-        
-        # Batch of observations case
-        elif observation.dim() == 2:
-            batch_size = observation.size(0)
-            
-            # Forward pass (for agents with energy only)
-            self.optimizer.zero_grad()
-            with torch.set_grad_enabled(True):
-                # Expand observations for all agents
-                # [batch_size, input_size] -> [batch_size, pop_size, input_size]
-                obs_expanded = observation.unsqueeze(1).expand(-1, self.pop_size, -1)
-                
-                # Expand reward for all agents
-                # [batch_size] -> [batch_size, pop_size]
-                if reward.dim() == 1 and reward.size(0) == batch_size:
-                    reward_expanded = reward.unsqueeze(1).expand(-1, self.pop_size)
-                else:
-                    # Assume scalar reward
-                    reward_expanded = torch.full((batch_size, self.pop_size), reward.item() if torch.is_tensor(reward) else reward, device=self.device)
-                
-                # Run model forward pass 
-                predictions = self.model(obs_expanded)
-                predictions = torch.sigmoid(predictions)
-                
-                # Make target tensor [batch_size, pop_size, 1]
-                target = reward_expanded.unsqueeze(-1)
-                
-                # Create energy mask [batch_size, pop_size, 1]
-                mask = has_energy.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, 1).to(dtype=predictions.dtype)
-                
-                # Element-wise loss with mask
-                error = predictions - target
-                loss = (error * error) * mask  # Squared error with mask
-                
-                # Calculate prediction error (for energy cost scaling)
-                prediction_error = torch.abs(error).mean(dim=0).squeeze(-1)  # [pop_size]
-                
-                # Apply energy cost proportional to prediction error
-                if self.evolvable_energy:
-                    # Scale energy cost by prediction error and energy efficiency
-                    energy_cost = torch.zeros_like(self.energy)
-                    energy_cost[has_energy] = self.energy_cost_learn[has_energy] * (0.5 + 0.5 * prediction_error[has_energy])
-                    # Apply energy cost
-                    self.energy -= energy_cost
-                else:
-                    # Scale energy cost by prediction error
-                    energy_cost = self.energy_cost_learn * (0.5 + 0.5 * prediction_error.mean().item())
-                    # Apply energy cost (only for agents with energy)
-                    self.energy[has_energy] -= energy_cost
-                
-                # Mean loss for agents with energy
-                loss = loss.sum() / (mask.sum() + 1e-8)
-                
-                # Add regularization
-                if self.l1_reg > 0:
-                    loss += self.l1_reg * self.model.l1_loss()
-                if self.l2_reg > 0:
-                    loss += self.l2_reg * self.model.l2_loss()
-                
-                # Backward pass and optimization
-                loss.backward()
-                self.optimizer.step()
-                
-                # Increment step count for agents with energy
-                self.step_count[has_energy] += 1
-        
+        # Reduce energy for prediction (for all alive agents)
+        if isinstance(self.energy_cost_predict, mx.array):
+            # Batch energy cost reduction for evolved parameters
+            energy_cost = mx.squeeze(self.energy_cost_predict, axis=1)
+            # Only reduce energy for alive agents
+            energy_reduction = energy_cost * alive_mask
+            self.energy = mx.maximum(0, self.energy - energy_reduction)
         else:
-            raise ValueError(f"Observation must be 1D or 2D, got {observation.dim()}D")
+            # Scalar energy cost
+            self.energy = mx.maximum(0, self.energy - (self.energy_cost_predict * alive_mask))
+        
+        # Get policy predictions
+        action_values = self.policy_net(observation)
+        
+        # Update step count for alive agents
+        self.step_count = self.step_count + mx.array(alive_mask, dtype=mx.int32)
+        
+        return action_values
+    
+    def learn(self, observation: mx.array, reward: mx.array, alive_mask: Optional[mx.array] = None) -> None:
+        """
+        Update the model based on the observed reward.
+        
+        Args:
+            observation: Input observation with shape [pop_size, input_size] 
+            reward: Reward for each agent with shape [pop_size]
+            alive_mask: Boolean mask indicating which agents are alive, shape [pop_size]
+        
+        Returns:
+            None
+        """
+        # Use the internal alive mask if not provided
+        if alive_mask is None:
+            alive_mask = self.alive_mask
+            
+        # Randomly determine which agents will learn this time
+        learn_mask = (mx.random.uniform((self.pop_size,)) < self.learn_prob) & alive_mask
+        
+        # Only continue if there are agents that want to learn
+        if not mx.any(learn_mask):
+            return
+            
+        # Check if agents have enough energy to learn
+        if isinstance(self.energy_cost_learn, mx.array):
+            # Batch energy check for evolved parameters
+            energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
+            can_learn_mask = (self.energy >= energy_cost) & learn_mask
+        else:
+            # Scalar energy check
+            can_learn_mask = (self.energy >= self.energy_cost_learn) & learn_mask
+            
+        # Only continue if there are agents that can learn
+        if not mx.any(can_learn_mask):
+            return
+            
+        # Reduce energy for learning agents
+        if isinstance(self.energy_cost_learn, mx.array):
+            # Batch energy reduction for evolved parameters
+            energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
+            energy_reduction = energy_cost * can_learn_mask
+            self.energy = mx.maximum(0, self.energy - energy_reduction)
+        else:
+            # Scalar energy reduction
+            self.energy = mx.maximum(0, self.energy - (self.energy_cost_learn * can_learn_mask))
+            
+        # Update learn decision counter
+        self.learn_decisions = self.learn_decisions + mx.array(can_learn_mask, dtype=mx.int32)
+        
+        # Define loss function using MLX's functional approach
+        def loss_fn(params):
+            # Extract parameters for policy network
+            policy_params = {}
+            idx = 0
+            for i, layer in enumerate(self.policy_net.layers):
+                if hasattr(layer, 'weight'):
+                    policy_params[f'layer_{i}_weight'] = params[idx]
+                    idx += 1
+                if hasattr(layer, 'bias'):
+                    policy_params[f'layer_{i}_bias'] = params[idx]
+                    idx += 1
+                    
+            # Extract output layer parameters
+            policy_params['output_weight'] = params[idx]
+            idx += 1
+            if hasattr(self.policy_net.output_layer, 'bias'):
+                policy_params['output_bias'] = params[idx]
+            
+            # Forward pass with these parameters
+            # This is simplified and would need to be implemented properly
+            # based on how your forward pass works with specific parameters
+            pred = self.policy_net(observation)
+            
+            # Compute MSE loss only for learning agents
+            squared_errors = mx.square(pred - reward.reshape(-1, 1))
+            mse_loss = mx.sum(squared_errors * can_learn_mask.reshape(-1, 1)) / mx.sum(can_learn_mask)
+            
+            # Add regularization
+            l1_loss = self.policy_net.l1_loss() * self.l1_reg
+            l2_loss = self.policy_net.l2_loss() * self.l2_reg
+            
+            return mse_loss + l1_loss + l2_loss
+        
+        # Get model parameters as a list
+        params = []
+        for layer in self.policy_net.layers:
+            if hasattr(layer, 'weight'):
+                params.append(layer.weight)
+            if hasattr(layer, 'bias'):
+                params.append(layer.bias)
+                
+        # Add output layer parameters
+        params.append(self.policy_net.output_layer.weight)
+        if hasattr(self.policy_net.output_layer, 'bias'):
+            params.append(self.policy_net.output_layer.bias)
+            
+        # Compute gradients
+        grads = mx.grad(loss_fn)(params)
+        
+        # Update parameters with gradients
+        for i, (param, grad) in enumerate(zip(params, grads)):
+            params[i] = param - self.learning_rate * grad
+            
+        # Update model parameters
+        idx = 0
+        for layer in self.policy_net.layers:
+            if hasattr(layer, 'weight'):
+                layer.weight = params[idx]
+                idx += 1
+            if hasattr(layer, 'bias'):
+                layer.bias = params[idx]
+                idx += 1
+                
+        # Update output layer parameters
+        self.policy_net.output_layer.weight = params[idx]
+        idx += 1
+        if hasattr(self.policy_net.output_layer, 'bias'):
+            self.policy_net.output_layer.bias = params[idx]
+            
+        # Increment training step counter
+        self.train_step += 1
     
     def update_energy(self, performance_factor=None) -> None:
         """
-        Update energy levels for all agents.
+        Update agent energy levels based on recovery rate.
         
         Args:
-            performance_factor: Optional tensor of performance factors [pop_size],
-                                values should be between 0 and 1, where higher is better
+            performance_factor: Optional factor to scale energy recovery 
+                               based on performance (not implemented yet)
         """
-        if self.evolvable_energy:
-            # Base recovery from agent genes
-            recovery = self.energy_recovery
-            
-            # Apply performance-based bonus if provided
-            if performance_factor is not None:
-                # Ensure performance_factor is on the correct device
-                if performance_factor.device != self.device:
-                    performance_factor = performance_factor.to(self.device)
-                
-                # Bonus ranges from 0% to 50% of base recovery
-                recovery = recovery * (1.0 + 0.5 * performance_factor)
-            
-            # Add recovery energy
-            self.energy = torch.clamp(self.energy + recovery, max=self.base_energy_init)
+        # Apply energy recovery for alive agents
+        if isinstance(self.energy_recovery, mx.array):
+            # Batch energy recovery for evolved parameters
+            recovery_rate = mx.squeeze(self.energy_recovery, axis=1)
+            energy_recovery = recovery_rate * self.alive_mask
         else:
-            # Fixed recovery for all agents
-            base_recovery = self.energy_recovery
+            # Scalar energy recovery
+            energy_recovery = self.energy_recovery * self.alive_mask
             
-            # Apply performance-based bonus if provided
-            if performance_factor is not None:
-                # Ensure performance_factor is on the correct device
-                if performance_factor.device != self.device:
-                    performance_factor = performance_factor.to(self.device)
-                
-                # Bonus ranges from 0% to 50% of base recovery
-                recovery = base_recovery * (1.0 + 0.5 * performance_factor)
-            else:
-                recovery = base_recovery
-            
-            # Add recovery energy
-            self.energy = torch.clamp(self.energy + recovery, max=self.energy_init)
-        
-        # Reset warnings for agents that have recovered energy
-        self.warned_low_energy = self.warned_low_energy & (self.energy < self.energy_cost_learn if not self.evolvable_energy 
-                                                          else self.energy < self.energy_cost_learn)
+        # Update energy levels
+        self.energy = self.energy + energy_recovery
     
-    def get_energy(self) -> torch.Tensor:
+    def get_energy(self) -> mx.array:
         """
-        Get current energy levels.
+        Get current energy levels for all agents.
         
         Returns:
-            Tensor of energy levels for all agents
+            Energy levels with shape [pop_size]
         """
         return self.energy
     
-    def get_layer_parameters(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_layer_parameters(self, layer_idx: int) -> Tuple[mx.array, mx.array]:
         """
-        Get the weights and biases for a specific layer.
+        Get parameters for a specific hidden layer.
         
         Args:
-            layer_idx: Index of the layer to get parameters for
+            layer_idx: Index of the hidden layer
             
         Returns:
-            Tuple of (weights, biases) tensors for the specified layer
+            Tuple of (weights, biases) for the specified layer
         """
-        if layer_idx >= len(self.model.layers):
-            raise ValueError(f"Invalid layer index: {layer_idx}, model has {len(self.model.layers)} layers")
-        
-        layer = self.model.layers[layer_idx]
-        return layer.weight.detach(), layer.bias.detach()
+        if layer_idx >= len(self.policy_net.layers):
+            raise ValueError(f"Layer index {layer_idx} out of range (max {len(self.policy_net.layers)-1})")
+            
+        layer = self.policy_net.layers[layer_idx]
+        return layer.weight, layer.bias
     
-    def set_layer_parameters(self, layer_idx: int, weights: torch.Tensor, biases: torch.Tensor) -> None:
+    def set_layer_parameters(self, layer_idx: int, weights: mx.array, biases: mx.array) -> None:
         """
-        Set the weights and biases for a specific layer.
+        Set parameters for a specific hidden layer.
         
         Args:
-            layer_idx: Index of the layer to set parameters for
-            weights: Tensor of shape [pop_size, output_size, input_size]
-            biases: Tensor of shape [pop_size, output_size]
+            layer_idx: Index of the hidden layer
+            weights: Weights for the layer with shape [pop_size, out_features, in_features]
+            biases: Biases for the layer with shape [pop_size, out_features]
         """
-        if layer_idx >= len(self.model.layers):
-            raise ValueError(f"Invalid layer index: {layer_idx}, model has {len(self.model.layers)} layers")
-        
-        layer = self.model.layers[layer_idx]
-        with torch.no_grad():
-            layer.weight.copy_(weights)
-            layer.bias.copy_(biases)
+        if layer_idx >= len(self.policy_net.layers):
+            raise ValueError(f"Layer index {layer_idx} out of range (max {len(self.policy_net.layers)-1})")
             
-    def get_output_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        layer = self.policy_net.layers[layer_idx]
+        layer.weight = weights
+        layer.bias = biases
+    
+    def get_output_parameters(self) -> Tuple[mx.array, mx.array]:
         """
-        Get the weights and biases for the output layer.
+        Get parameters for the output layer.
         
         Returns:
-            Tuple of (weights, biases) tensors for the output layer
+            Tuple of (weights, biases) for the output layer
         """
-        return self.model.output_layer.weight.detach(), self.model.output_layer.bias.detach()
+        return self.policy_net.output_layer.weight, self.policy_net.output_layer.bias
     
-    def set_output_parameters(self, weights: torch.Tensor, biases: torch.Tensor) -> None:
+    def set_output_parameters(self, weights: mx.array, biases: mx.array) -> None:
         """
-        Set the weights and biases for the output layer.
+        Set parameters for the output layer.
         
         Args:
-            weights: Tensor of shape [pop_size, 1, hidden_size]
-            biases: Tensor of shape [pop_size, 1]
+            weights: Weights for the output layer with shape [pop_size, out_features, in_features]
+            biases: Biases for the output layer with shape [pop_size, out_features]
         """
-        with torch.no_grad():
-            self.model.output_layer.weight.copy_(weights)
-            self.model.output_layer.bias.copy_(biases)
+        self.policy_net.output_layer.weight = weights
+        self.policy_net.output_layer.bias = biases
     
     def reset_state(self) -> None:
-        """Reset agent state variables for a new generation."""
-        # Don't reset energy levels between generations
-        # self.energy = torch.full((self.pop_size,), self.energy_init, device=self.device)
-        
-        self.step_count = torch.zeros(self.pop_size, device=self.device)
-        self.warned_low_energy = torch.zeros(self.pop_size, dtype=torch.bool, device=self.device)
-        self.total_reward = torch.zeros(self.pop_size, device=self.device)
-    
-    def update_reward(self, rewards: torch.Tensor) -> None:
         """
-        Update total rewards for agents.
+        Reset the agent state (not the learned parameters).
+        """
+        # Reset energy levels
+        self.energy = mx.ones((self.pop_size,)) * self.energy_init
+        
+        # Reset tracking variables
+        self.cumulative_reward = mx.zeros((self.pop_size,))
+        self.step_count = mx.zeros((self.pop_size,), dtype=mx.int32)
+        self.lci_values = mx.zeros((self.pop_size,))
+        self.learn_decisions = mx.zeros((self.pop_size,), dtype=mx.int32)
+        self.alive_mask = mx.ones((self.pop_size,), dtype=mx.bool_)
+    
+    def update_reward(self, rewards: mx.array) -> None:
+        """
+        Update cumulative rewards for each agent.
         
         Args:
-            rewards: Tensor of rewards for each agent [pop_size]
+            rewards: Rewards for each agent with shape [pop_size]
         """
-        if not hasattr(self, 'total_reward'):
-            self.total_reward = torch.zeros(self.pop_size, device=self.device)
-            
-        # Add rewards to total
-        self.total_reward += rewards
+        # Update rewards for all alive agents
+        self.cumulative_reward = self.cumulative_reward + (rewards * self.alive_mask)
         
-        # Increment step count
-        self.step_count += 1
+        # Update LCI values (reward per step)
+        steps_safe = mx.maximum(self.step_count, 1)  # Avoid division by zero
+        self.lci_values = self.cumulative_reward / steps_safe
     
-    def get_lci(self) -> torch.Tensor:
+    def get_lci(self) -> mx.array:
         """
-        Get the LCI (Learning Capacity Index) for all agents.
-        LCI is calculated as total reward per step.
+        Get the current LCI values (Learning, Computation, Information tradeoff).
+        
+        These are computed as reward per step, measuring how efficiently
+        the agent is balancing its learning and action selection.
         
         Returns:
-            Tensor of LCI values for all agents
+            LCI values with shape [pop_size]
         """
-        if not hasattr(self, 'total_reward'):
-            return torch.zeros(self.pop_size, device=self.device)
-            
-        # Avoid division by zero
-        steps = torch.clamp(self.step_count, min=1.0)
-        return self.total_reward / steps
+        return self.lci_values
     
-    def get_alive_mask(self) -> torch.Tensor:
+    def get_alive_mask(self) -> mx.array:
         """
-        Get mask indicating which agents are alive (have energy > 0).
+        Get mask indicating which agents are alive.
         
         Returns:
-            Boolean tensor with True for alive agents
+            Boolean mask with shape [pop_size]
         """
-        return self.energy > 0
+        return self.alive_mask
     
-    def get_step_count(self) -> torch.Tensor:
+    def get_step_count(self) -> mx.array:
         """
-        Get step count for all agents.
+        Get the number of steps taken by each agent.
         
         Returns:
-            Tensor of step counts
+            Step count with shape [pop_size]
         """
         return self.step_count
     
     def save_agent(self, path: str) -> None:
         """
-        Save agent state.
+        Save the agent parameters to disk.
         
         Args:
-            path: Path to save the agent state
+            path: Path to save the parameters
         """
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(path), exist_ok=True)
         
-        # Save model
-        model_path = f"{path}_model.pt"
-        self.model.save_population(model_path)
+        # Save policy network parameters
+        self.policy_net.save_population(path)
         
-        # Save agent state
-        state = {
-            'energy': self.energy,
-            'step_count': self.step_count,
-            'energy_cost_predict': self.energy_cost_predict,
-            'energy_cost_learn': self.energy_cost_learn,
-            'energy_init': self.energy_init,
-            'energy_recovery': self.energy_recovery,
-            'learning_rate': self.learning_rate,
-            'l1_reg': self.l1_reg,
-            'l2_reg': self.l2_reg,
-            'pop_size': self.pop_size,
-            'input_size': self.input_size
-        }
-        torch.save(state, f"{path}_state.pt")
+        # Save other agent parameters individually
+        mx.save(f"{path}_energy", self.energy)
+        mx.save(f"{path}_cumulative_reward", self.cumulative_reward)
+        mx.save(f"{path}_step_count", self.step_count)
+        mx.save(f"{path}_lci_values", self.lci_values)
+        mx.save(f"{path}_learn_decisions", self.learn_decisions)
+        mx.save(f"{path}_alive_mask", self.alive_mask)
+        
+        # Save evolvable energy parameters if applicable
+        if self.evolvable_energy:
+            if isinstance(self.energy_cost_predict, mx.array):
+                mx.save(f"{path}_energy_cost_predict", self.energy_cost_predict)
+            if isinstance(self.energy_cost_learn, mx.array):
+                mx.save(f"{path}_energy_cost_learn", self.energy_cost_learn)
+            if isinstance(self.energy_recovery, mx.array):
+                mx.save(f"{path}_energy_recovery", self.energy_recovery)
     
     def load_agent(self, path: str) -> None:
         """
-        Load agent state.
+        Load agent parameters from disk.
         
         Args:
-            path: Path to load the agent state from
+            path: Path to load parameters from
         """
-        # Load model
-        model_path = f"{path}_model.pt"
-        self.model.load_population(model_path)
+        # Load policy network parameters
+        self.policy_net.load_population(path)
         
-        # Load agent state
-        state = torch.load(f"{path}_state.pt", map_location=self.device)
-        self.energy = state['energy'].to(self.device)
-        self.step_count = state['step_count'].to(self.device)
-        self.energy_cost_predict = state['energy_cost_predict']
-        self.energy_cost_learn = state['energy_cost_learn']
-        self.energy_init = state['energy_init']
-        self.energy_recovery = state['energy_recovery']
-        self.learning_rate = state['learning_rate']
-        self.l1_reg = state['l1_reg']
-        self.l2_reg = state['l2_reg']
-        self.pop_size = state['pop_size']
-        self.input_size = state['input_size']
+        # Load other agent parameters
+        self.energy = mx.load(f"{path}_energy")
+        self.cumulative_reward = mx.load(f"{path}_cumulative_reward")
+        self.step_count = mx.load(f"{path}_step_count")
+        self.lci_values = mx.load(f"{path}_lci_values")
+        self.learn_decisions = mx.load(f"{path}_learn_decisions")
+        self.alive_mask = mx.load(f"{path}_alive_mask")
         
-        # Ensure optimizer is updated with new model parameters
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        
-        # Reset warnings
-        self.warned_low_energy = torch.zeros(self.pop_size, dtype=torch.bool, device=self.device) 
+        # Load evolvable energy parameters if applicable
+        if self.evolvable_energy:
+            try:
+                self.energy_cost_predict = mx.load(f"{path}_energy_cost_predict")
+                self.energy_cost_learn = mx.load(f"{path}_energy_cost_learn")
+                self.energy_recovery = mx.load(f"{path}_energy_recovery")
+            except:
+                # If files don't exist, keep the current values
+                pass

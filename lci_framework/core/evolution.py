@@ -1,20 +1,17 @@
 """
-GPU-Optimized Tensor Evolution
+Tensor Evolution with MLX
 
 This module implements a fully vectorized evolutionary algorithm that 
-optimizes agent populations using GPU acceleration.
+optimizes agent populations using Apple Silicon acceleration.
 """
 
-import torch
-import numpy as np
+import mlx.core as mx
 import os
 import logging
 import time
 import matplotlib.pyplot as plt
 import json
 from typing import Dict, List, Tuple, Any, Optional, Union
-from pathlib import Path
-from tqdm import tqdm
 import traceback
 
 from lci_framework.agents.agent import TensorLCIAgent
@@ -26,7 +23,7 @@ logger = logging.getLogger(__name__)
 class TensorEvolution:
     """
     TensorEvolution implements a tensor-based evolutionary algorithm for optimizing LCI agents
-    using GPU acceleration.
+    using Apple Silicon acceleration with MLX.
     
     Algorithmic Design:
     ------------------
@@ -76,13 +73,12 @@ class TensorEvolution:
                 learn_prob: float = 0.1,
                 evolvable_energy: bool = True,
                 output_dir: str = "results",
-                device: Optional[torch.device] = None):
+                device: Optional[Any] = None):
         """
         Initialize the tensor evolution framework.
         
-        This refactored version is designed to work with TensorLCIAgent's
-        population-based architecture directly, rather than treating it as
-        a collection of individual agents.
+        This is designed to work with TensorLCIAgent's population-based architecture
+        directly, rather than treating it as a collection of individual agents.
         
         Args:
             pop_size: Number of agents in the population
@@ -107,21 +103,8 @@ class TensorEvolution:
             learn_prob: Learn probability for the agents
             evolvable_energy: Whether the agents' energy can evolve
             output_dir: Directory to save results
-            device: Device for computation (auto-detected if None)
+            device: Not used in MLX (kept for API compatibility)
         """
-        # Determine the device
-        if device is not None:
-            self.device = device
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-            logger.info("Using specified device: mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            logger.info("Using specified device: cuda")
-        else:
-            self.device = torch.device("cpu")
-            logger.warning("No GPU available. Using CPU, which will be slow for tensor operations.")
-        
         # Store parameters
         self.pop_size = pop_size
         self.mutation_rate = mutation_rate
@@ -134,11 +117,12 @@ class TensorEvolution:
         self.n_states = n_states
         self.n_actions = n_actions
         
+        logger.info("Using MLX with unified memory architecture for Apple Silicon acceleration")
+        
         # Create vectorized environment
         self.env = VectorizedMarkovEnvironment(
             n_states=n_states,
-            n_actions=n_actions,
-            device=self.device
+            n_actions=n_actions
         )
         
         # Create population of agents (as a single TensorLCIAgent instance)
@@ -156,8 +140,7 @@ class TensorEvolution:
             l1_reg=l1_reg,
             l2_reg=l2_reg,
             learn_prob=learn_prob,
-            evolvable_energy=evolvable_energy,
-            device=self.device
+            evolvable_energy=evolvable_energy
         )
         
         # Ensure output directory exists
@@ -189,7 +172,7 @@ class TensorEvolution:
         """
         # Get current energy levels for all agents
         energy_levels = self.agents.get_energy()
-        low_energy_count = torch.sum(energy_levels < self.agents.energy_cost_learn).item()
+        low_energy_count = mx.sum(energy_levels < self.agents.energy_cost_learn).item()
         
         # Only log warnings at a reasonable frequency
         current_time = time.time()
@@ -202,15 +185,17 @@ class TensorEvolution:
             mean_energy = energy_levels.mean().item()
             max_energy = energy_levels.max().item()
             
-            # Convert energy costs to scalar values for safe string formatting
-            learn_cost = self.agents.energy_cost_learn
-            recovery_rate = self.agents.energy_recovery
-            
-            # Convert tensors to scalar values if necessary
-            if isinstance(learn_cost, torch.Tensor):
-                learn_cost = learn_cost.mean().item()
-            if isinstance(recovery_rate, torch.Tensor):
-                recovery_rate = recovery_rate.mean().item()
+            # Get energy costs for learning (may be per-agent or scalar)
+            if isinstance(self.agents.energy_cost_learn, mx.array):
+                learn_cost = self.agents.energy_cost_learn.mean().item()
+            else:
+                learn_cost = self.agents.energy_cost_learn
+                
+            # Get recovery rate (may be per-agent or scalar)
+            if isinstance(self.agents.energy_recovery, mx.array):
+                recovery_rate = self.agents.energy_recovery.mean().item()
+            else:
+                recovery_rate = self.agents.energy_recovery
             
             # Log detailed warning first time, then less frequently
             if self._energy_warning_count == 1:
@@ -258,10 +243,10 @@ class TensorEvolution:
             'lci_values', 'n_alive'
         ])
         
-        # Initialize tensors on the correct device
+        # Initialize arrays
         rewards = self._zeros_like_population()
-        step_counts = torch.zeros(self.pop_size, dtype=torch.int, device=self.device)
-        alive_agents = torch.ones(self.pop_size, dtype=torch.bool, device=self.device)
+        step_counts = mx.zeros((self.pop_size,), dtype=mx.int32)
+        alive_agents = mx.ones((self.pop_size,), dtype=mx.bool_)
         
         # Reset the environment for all agents
         observations = self.env.reset(pop_size=self.pop_size)
@@ -298,26 +283,26 @@ class TensorEvolution:
             logger.error(f"Missing required attributes in state: {missing_attrs}")
             return state
         
-        # Create mutable copies of tensors we'll update
-        rewards = state.rewards.clone()
-        step_counts = state.step_counts.clone()
-        alive_agents = state.alive_agents.clone()
-        observations = state.observations.clone() if isinstance(state.observations, torch.Tensor) else state.observations
-        lci_values = state.lci_values.clone()
+        # Create copies of arrays we'll update
+        rewards = state.rewards
+        step_counts = state.step_counts
+        alive_agents = state.alive_agents
+        observations = state.observations
+        lci_values = state.lci_values
         n_alive = state.n_alive
         
-        # Initialize energy tracking tensor for this generation
+        # Initialize energy tracking array for this generation
         # Format: [step_idx, mean, min, max, std]
         # Pre-allocate for all steps plus initial state (steps_per_generation + 1)
-        energy_tracking = torch.zeros((self.steps_per_generation + 1, 5), device=self.device)
+        energy_tracking = mx.zeros((self.steps_per_generation + 1, 5))
         
         # Track initial energy
         energy_levels = self.agents.get_energy()
-        energy_tracking[0, 0] = 0  # step 0
-        energy_tracking[0, 1] = energy_levels.mean()
-        energy_tracking[0, 2] = energy_levels.min()
-        energy_tracking[0, 3] = energy_levels.max()
-        energy_tracking[0, 4] = energy_levels.std() if energy_levels.numel() > 1 else 0.0
+        energy_tracking[0, 0] = 0.0  # step 0
+        energy_tracking[0, 1] = mx.mean(energy_levels).item()
+        energy_tracking[0, 2] = mx.min(energy_levels).item()
+        energy_tracking[0, 3] = mx.max(energy_levels).item()
+        energy_tracking[0, 4] = mx.std(energy_levels).item() if energy_levels.size > 1 else 0.0
         
         # Simulate until all agents are dead or max steps reached
         step = 0
@@ -326,16 +311,15 @@ class TensorEvolution:
                 # Monitor agent energy levels
                 self._monitor_agent_energy()
                 
-                # Get actions from alive agents - TensorLCIAgent's predict method handles
-                # filtering agents with energy internally
+                # Get actions from alive agents
                 actions = self._get_actions_from_population(observations, alive_agents)
                 
                 # Step the environment for all alive agents
-                next_observations, reward_batch, done_batch, info = self.env.step_batch(actions)
+                next_observations, reward_batch, done_batch, info = self.env.step(actions)
                 
                 # Validate environment response
                 if not (len(next_observations) == len(reward_batch) == len(done_batch) == self.pop_size):
-                    logger.error(f"Environment step_batch returned inconsistent data sizes: " 
+                    logger.error(f"Environment step returned inconsistent data sizes: " 
                                 f"observations: {len(next_observations)}, rewards: {len(reward_batch)}, "
                                 f"dones: {len(done_batch)}, expected: {self.pop_size}")
                     break
@@ -350,18 +334,19 @@ class TensorEvolution:
                 
                 # Track energy after this step
                 energy_levels = self.agents.get_energy()
-                energy_tracking[step, 0] = step
-                energy_tracking[step, 1] = energy_levels.mean()
-                energy_tracking[step, 2] = energy_levels.min()
-                energy_tracking[step, 3] = energy_levels.max()
-                energy_tracking[step, 4] = energy_levels.std() if energy_levels.numel() > 1 else 0.0
+                energy_tracking[step, 0] = float(step)
+                energy_tracking[step, 1] = mx.mean(energy_levels).item()
+                energy_tracking[step, 2] = mx.min(energy_levels).item()
+                energy_tracking[step, 3] = mx.max(energy_levels).item()
+                energy_tracking[step, 4] = mx.std(energy_levels).item() if energy_levels.size > 1 else 0.0
                 
                 # Periodic logging
                 if step % 50 == 0:
-                    logger.debug(f"Step {step}: {n_alive} agents alive, Mean energy: {energy_levels.mean().item():.4f}")
+                    logger.debug(f"Step {step}: {n_alive} agents alive, Mean energy: {mx.mean(energy_levels).item():.4f}")
                     
             except Exception as e:
                 logger.error(f"Error during simulation step {step}: {str(e)}")
+                traceback.print_exc()  # Print full traceback for debugging
                 break
         
         # Store this generation's energy tracking (only up to the steps we actually ran)
@@ -371,15 +356,15 @@ class TensorEvolution:
         if not hasattr(self, 'step_energy_tracking'):
             self.step_energy_tracking = []
             
-        # Convert tensor to list of dictionaries for JSON serialization (only at the end)
+        # Convert array to list of dictionaries for JSON serialization
         generation_tracking = []
         for i in range(valid_steps):
             generation_tracking.append({
                 'step': int(energy_tracking[i, 0].item()),
-                'mean': energy_tracking[i, 1].item(),
-                'min': energy_tracking[i, 2].item(),
-                'max': energy_tracking[i, 3].item(),
-                'std': energy_tracking[i, 4].item()
+                'mean': float(energy_tracking[i, 1].item()),
+                'min': float(energy_tracking[i, 2].item()),
+                'max': float(energy_tracking[i, 3].item()),
+                'std': float(energy_tracking[i, 4].item())
             })
             
         self.step_energy_tracking.append(generation_tracking)
@@ -405,46 +390,86 @@ class TensorEvolution:
         Get actions from the agent population using batch operations.
         
         Args:
-            observations: Current observations for all agents
-            alive_agents: Boolean tensor indicating which agents are alive
+            observations: Current observations for all agents (MLX array)
+            alive_agents: Boolean array indicating which agents are alive (MLX array)
             
         Returns:
-            Tensor of actions for all agents
+            MLX array of actions for all agents
         """
         try:
+            # Debug: Check input types
+            logger.debug(f"observations type: {type(observations)}, shape: {getattr(observations, 'shape', None)}")
+            logger.debug(f"alive_agents type: {type(alive_agents)}, shape: {getattr(alive_agents, 'shape', None)}")
+            
             # Ensure observations are in the right shape for batch processing
-            if isinstance(observations, torch.Tensor) and observations.dim() == 2:
+            if not hasattr(observations, 'shape'):
+                logger.error(f"Observations missing shape attribute: {type(observations)}")
+                return mx.zeros((self.pop_size,), dtype=mx.int32)
+                
+            if observations.ndim == 2 and observations.shape[0] == self.pop_size:
                 # Already in correct shape [pop_size, observation_size]
                 pass
-            elif isinstance(observations, list) and len(observations) == self.pop_size:
-                # Convert list to tensor
-                observations = torch.stack([obs.to(self.device) if isinstance(obs, torch.Tensor) 
-                                           else torch.tensor(obs, device=self.device) 
-                                           for obs in observations])
+            elif hasattr(observations, 'ndim') and observations.ndim != 2:
+                logger.error(f"Observations have unexpected dimensions: {observations.ndim}")
+                return mx.zeros((self.pop_size,), dtype=mx.int32)
             else:
                 logger.error(f"Observations in unexpected format: {type(observations)}")
-                return torch.zeros(self.pop_size, dtype=torch.long, device=self.device)
+                return mx.zeros((self.pop_size,), dtype=mx.int32)
                 
             # Get predictions from the model using all agents (not just alive ones)
             # This avoids tensor shape mismatch issues when some agents die
-            with torch.no_grad():
-                # Pass alive_agents mask to the predict method
-                predictions = self.agents.predict(observations, alive_mask=alive_agents)
+            predictions = self.agents.predict(observations, alive_mask=alive_agents)
+            logger.debug(f"predictions type: {type(predictions)}, shape: {getattr(predictions, 'shape', None)}")
+            
+            # Safely convert to action indices - threshold at 0.5
+            # First squeeze the trailing dimension
+            squeezed_preds = mx.squeeze(predictions, axis=-1)
+            logger.debug(f"squeezed_preds type: {type(squeezed_preds)}, shape: {getattr(squeezed_preds, 'shape', None)}")
+            
+            # Create a boolean array
+            bool_actions = squeezed_preds >= 0.5
+            logger.debug(f"bool_actions type: {type(bool_actions)}, shape: {getattr(bool_actions, 'shape', None)}")
+            
+            # Use direct array creation to avoid tuple issues
+            try:
+                actions = mx.zeros(bool_actions.shape, dtype=mx.int32)
+                actions = mx.where(bool_actions, mx.array(1, dtype=mx.int32), mx.array(0, dtype=mx.int32))
+                logger.debug(f"actions type: {type(actions)}, shape: {getattr(actions, 'shape', None)}")
+            except Exception as e:
+                logger.error(f"Error creating actions array: {str(e)}")
+                # Try alternative array creation
+                actions = mx.zeros((self.pop_size,), dtype=mx.int32)
+                for i in range(self.pop_size):
+                    if bool_actions[i].item():
+                        actions = mx.array_at_indices(actions, i, mx.array(1, dtype=mx.int32))
+            
+            # For agents that aren't alive, use random actions (they'll be ignored in updates)
+            if mx.sum(~alive_agents) > 0:
+                # Generate random actions for dead agents
+                num_dead = int(mx.sum(~alive_agents).item())
+                random_actions = mx.random.randint(0, self.n_actions, shape=(num_dead,), dtype=mx.int32)
+                logger.debug(f"random_actions type: {type(random_actions)}, shape: {getattr(random_actions, 'shape', None)}")
                 
-                # Convert to action indices
-                actions = (predictions.squeeze(-1) >= 0.5).long()
-                
-                # For agents that aren't alive, use random actions (they'll be ignored in updates)
-                mask = ~alive_agents
-                if mask.any():
-                    random_actions = torch.randint(0, self.n_actions, (mask.sum(),), device=self.device)
-                    actions[mask] = random_actions
-                
-                return actions
+                # Loop through dead agents and update their actions one by one
+                dead_idx = 0
+                for i in range(self.pop_size):
+                    if not alive_agents[i].item():
+                        try:
+                            # Get integer value, not a tuple
+                            action_value = int(random_actions[dead_idx].item()) 
+                            logger.debug(f"action_value: {action_value}, type: {type(action_value)}")
+                            
+                            # Use array_at_indices for safe assignment
+                            actions = mx.array_at_indices(actions, i, mx.array(action_value, dtype=mx.int32))
+                            dead_idx += 1
+                        except Exception as e:
+                            logger.error(f"Error updating action at index {i}: {str(e)}")
+            
+            return actions
         except Exception as e:
             logger.error(f"Error getting agent actions: {str(e)}")
             # Return default actions for the full population
-            return torch.zeros(self.pop_size, dtype=torch.long, device=self.device)
+            return mx.zeros((self.pop_size,), dtype=mx.int32)
 
     def _update_batch_state(self, rewards, step_counts, alive_agents, observations, 
                            lci_values, n_alive, actions, next_observations, 
@@ -453,41 +478,56 @@ class TensorEvolution:
         Update simulation state based on environment step results,
         handling the entire population as a batch.
         
+        Args:
+            rewards: MLX array of rewards
+            step_counts: MLX array of step counts
+            alive_agents: MLX boolean array of alive status
+            observations: MLX array of current observations
+            lci_values: MLX array of LCI values
+            n_alive: Number of alive agents
+            actions: MLX array of actions
+            next_observations: MLX array of next observations
+            reward_batch: MLX array of rewards from environment
+            done_batch: MLX array of done flags from environment
+            
         Returns:
-            Tuple of updated state tensors
+            Tuple of updated state arrays (all MLX arrays)
         """
-        # Verify tensor dimensions
-        if rewards.shape[0] != self.pop_size or step_counts.shape[0] != self.pop_size:
-            logger.warning(f"Tensor dimension mismatch in _update_batch_state. "
-                          f"Expected pop_size={self.pop_size}, got rewards={rewards.shape}, "
-                          f"step_counts={step_counts.shape}")
-            # Ensure dimensions match by recreating tensors if needed
-            rewards = torch.zeros(self.pop_size, device=self.device)
-            step_counts = torch.zeros(self.pop_size, dtype=torch.int, device=self.device)
-            alive_agents = torch.ones(self.pop_size, dtype=torch.bool, device=self.device)
-            lci_values = torch.zeros(self.pop_size, device=self.device)
+        # Verify array dimensions - create new arrays if needed
+        if not hasattr(rewards, 'shape') or rewards.shape[0] != self.pop_size or step_counts.shape[0] != self.pop_size:
+            logger.warning(f"Array dimension mismatch in _update_batch_state. "
+                          f"Expected pop_size={self.pop_size}, got rewards shape={getattr(rewards, 'shape', None)}, "
+                          f"step_counts shape={getattr(step_counts, 'shape', None)}")
+            # Ensure dimensions match by recreating arrays
+            rewards = mx.zeros((self.pop_size,))
+            step_counts = mx.zeros((self.pop_size,), dtype=mx.int32)
+            alive_agents = mx.ones((self.pop_size,), dtype=mx.bool_)
+            lci_values = mx.zeros((self.pop_size,))
         
-        # Use in-place operations where possible to reduce memory usage
+        # Use MLX operations where possible
         
-        # Update rewards for alive agents (in-place)
-        rewards = torch.where(alive_agents, rewards + reward_batch, rewards)
+        # Update rewards for alive agents
+        rewards = mx.where(alive_agents, rewards + reward_batch, rewards)
         
-        # Update step counts for alive agents (in-place)
-        step_counts = torch.where(alive_agents, step_counts + 1, step_counts)
+        # Update step counts for alive agents
+        step_counts = mx.where(alive_agents, step_counts + 1, step_counts)
         
         # Get energy levels to check which agents are still alive
         energy = self.agents.get_energy()
         
         # Calculate performance factors (reward relative to maximum possible)
-        performance_factor = torch.clamp(reward_batch / 1.0, min=0.0, max=1.0)
+        performance_factor = mx.clip(reward_batch / 1.0, a_min=0.0, a_max=1.0)
         
         # Learn from experience using batched operations
-        if alive_agents.any():
-            # Determine which agents should learn (vectorized operation)
+        if mx.sum(alive_agents) > 0:
+            # Determine which agents should learn
             learn_prob = getattr(self.agents, 'learn_probability', 0.1)
-            learn_rand = torch.rand(self.pop_size, device=self.device)
             
-            if isinstance(learn_prob, torch.Tensor):
+            # Create random values for learn probability check
+            learn_rand = mx.random.uniform(shape=(self.pop_size,))
+            
+            # Determine learn mask based on probability
+            if hasattr(learn_prob, 'shape'):
                 # Use each agent's individual learn probability
                 learn_mask = alive_agents & (learn_rand < learn_prob)
             else:
@@ -495,7 +535,7 @@ class TensorEvolution:
                 learn_mask = alive_agents & (learn_rand < learn_prob)
             
             # Only attempt learning if at least one agent should learn
-            if learn_mask.any():
+            if mx.sum(learn_mask) > 0:
                 # Let the agent's learn method handle batching and energy checks
                 try:
                     # Pass alive_agents mask to learn method
@@ -509,30 +549,32 @@ class TensorEvolution:
         # Get updated energy after recovery
         energy = self.agents.get_energy()
         
-        # Update alive status based on done flag and energy (vectorized)
+        # Update alive status based on done flag and energy
         new_alive_agents = alive_agents & ~done_batch & (energy > 0)
-        n_alive = new_alive_agents.sum().item()
+        n_alive = mx.sum(new_alive_agents).item()
         
-        # Update observations for agents that are still alive (fully vectorized)
-        if isinstance(observations, torch.Tensor) and isinstance(next_observations, torch.Tensor):
-            # Verify observation tensor dimensions
+        # Update observations for agents that are still alive
+        if hasattr(observations, 'shape') and hasattr(next_observations, 'shape'):
+            # Verify observation array dimensions
             if observations.shape[0] != self.pop_size or next_observations.shape[0] != self.pop_size:
                 logger.warning(f"Observation dimension mismatch. Expected pop_size={self.pop_size}, "
-                               f"got observations={observations.shape}, next_observations={next_observations.shape}")
+                               f"got observations shape={observations.shape}, next_observations shape={next_observations.shape}")
                 # Reset observations to default
                 observations = self._get_default_observations()
             else:
-                # Create a mask tensor that's the same shape as observations
-                mask = new_alive_agents.unsqueeze(1).expand_as(observations)
-                observations = torch.where(mask, next_observations, observations)
+                # Create a mask for selecting observations by expanding dimensions for proper broadcasting
+                mask = mx.expand_dims(new_alive_agents, axis=1)
+                # Broadcast mask to match observation dimensions
+                mask = mx.broadcast_to(mask, observations.shape)
+                # Update observations using where
+                observations = mx.where(mask, next_observations, observations)
         else:
-            # Handle non-tensor observations if absolutely necessary
-            for i in range(min(len(observations), len(next_observations), self.pop_size)):
-                if i < len(new_alive_agents) and new_alive_agents[i]:
-                    observations[i] = next_observations[i]
+            # Get fresh observations if dimensions don't match
+            observations = self._get_default_observations()
         
-        # Update LCI values (vectorized)
-        lci_values = rewards / torch.clamp(step_counts.float(), min=1)
+        # Update LCI values - use maximum safe value of 1 for step_counts to avoid division by zero
+        step_counts_safe = mx.maximum(step_counts, 1)
+        lci_values = rewards / step_counts_safe
         
         # Update alive agents
         alive_agents = new_alive_agents
@@ -542,10 +584,10 @@ class TensorEvolution:
     def _get_default_observations(self):
         """
         Get default observations for the entire population.
-        Used when tensor dimensions don't match.
+        Used when array dimensions don't match.
         
         Returns:
-            Tensor of default observations
+            Array of default observations
         """
         # We'll use the environment's reset method to get default observations
         return self.env.reset(self.pop_size)
@@ -558,7 +600,7 @@ class TensorEvolution:
             fitness_data: FitnessState containing fitness tracking data
             
         Returns:
-            Tuple of (fitness tensor, LCI values tensor)
+            Tuple of (fitness array, LCI values array)
         """
         try:
             # Extract values needed for calculation
@@ -567,7 +609,7 @@ class TensorEvolution:
             lci_values = fitness_data.lci_values
             
             # Avoid division by zero
-            step_counts_safe = torch.clamp(step_counts, min=1)
+            step_counts_safe = mx.maximum(step_counts, 1)
             
             # Calculate fitness as average reward per step (pure calculation)
             fitness = self._calculate_fitness_from_rewards(rewards, step_counts_safe)
@@ -585,29 +627,32 @@ class TensorEvolution:
         except Exception as e:
             logger.error(f"Error calculating fitness: {str(e)}")
             # Return default values in case of error
-            return torch.zeros(self.pop_size, device=self.device), torch.zeros(self.pop_size, device=self.device)
+            return mx.zeros(self.pop_size), mx.zeros(self.pop_size)
     
     def _calculate_fitness_from_rewards(self, rewards, step_counts_safe):
         """
         Calculate fitness from rewards and step counts.
         
         Args:
-            rewards: Tensor of rewards for each agent
-            step_counts_safe: Tensor of step counts for each agent (clamped to avoid division by zero)
+            rewards: Array of rewards for each agent
+            step_counts_safe: Array of step counts for each agent (clamped to avoid division by zero)
             
         Returns:
-            Tensor of fitness values for each agent
+            Array of fitness values for each agent
         """
-        return rewards / step_counts_safe.float()
+        # Convert step_counts_safe to float directly rather than using astype
+        # to avoid tuple creation issues
+        step_counts_float = mx.array(step_counts_safe, dtype=mx.float32)
+        return rewards / step_counts_float
     
     def _calculate_statistics(self, fitness, lci_values, step_counts):
         """
         Calculate statistics for the current generation.
         
         Args:
-            fitness: Tensor of fitness values for each agent
-            lci_values: Tensor of LCI values for each agent
-            step_counts: Tensor of step counts for each agent
+            fitness: Array of fitness values for each agent
+            lci_values: Array of LCI values for each agent
+            step_counts: Array of step counts for each agent
             
         Returns:
             Named tuple with statistics
@@ -619,22 +664,23 @@ class TensorEvolution:
         ])
         
         # Find the agent with highest fitness
-        max_fitness_value, best_idx = torch.max(fitness, dim=0)
+        max_fitness_value = mx.max(fitness).item()
+        best_idx = mx.argmax(fitness).item()
         
         # Get alive count directly from agent energy levels
         # Only count agents with enough energy to learn as "alive"
         energy_levels = self.agents.get_energy()
-        alive_count = (energy_levels >= self.agents.energy_cost_learn).sum().item()
+        alive_count = mx.sum(energy_levels >= self.agents.energy_cost_learn).item()
         
         return Stats(
             generation=self.generation,
-            mean_fitness=fitness.mean().item(),
-            std_fitness=fitness.std().item() if fitness.numel() > 1 else 0.0,
-            max_fitness=max_fitness_value.item(),
-            mean_lci=lci_values.mean().item(),
-            max_lci=lci_values.max().item(),
+            mean_fitness=mx.mean(fitness).item(),
+            std_fitness=mx.std(fitness).item() if fitness.size > 1 else 0.0,
+            max_fitness=max_fitness_value,
+            mean_lci=mx.mean(lci_values).item(),
+            max_lci=mx.max(lci_values).item(),
             alive_count=alive_count,
-            best_idx=best_idx.item()
+            best_idx=best_idx
         )
     
     def _log_generation_stats(self, stats):
@@ -684,7 +730,7 @@ class TensorEvolution:
             'mean': energy_levels.mean().item(),
             'min': energy_levels.min().item(),
             'max': energy_levels.max().item(),
-            'std': energy_levels.std().item() if energy_levels.numel() > 1 else 0.0
+            'std': energy_levels.std().item() if energy_levels.size > 1 else 0.0
         })
         
         # Check if this is the best fitness seen so far
@@ -696,7 +742,7 @@ class TensorEvolution:
             self.best_agent_history.append({
                 'generation': stats.generation,
                 'fitness': stats.max_fitness,
-                'lci': self.agents.get_lci().max().item()  # Use get_lci() method instead of lci attribute
+                'lci': self.agents.get_lci().max()  # Use get_lci() method instead of lci attribute
             })
 
     def _run_tournament_selection(self, fitness):
@@ -704,7 +750,7 @@ class TensorEvolution:
         Run tournament selection to select parents for reproduction.
         
         Args:
-            fitness: Tensor of fitness values for the population
+            fitness: Array of fitness values for the population
             
         Returns:
             Indices of the winners from each tournament
@@ -714,50 +760,61 @@ class TensorEvolution:
 
     def _vectorized_tournament_selection(self, fitness):
         """
-        Vectorized tournament selection that uses tensor operations to run all tournaments in parallel.
+        Vectorized tournament selection that uses array operations to run all tournaments in parallel.
         
         Args:
-            fitness: Tensor of fitness values for the population [pop_size]
+            fitness: MLX array of fitness values for the population [pop_size]
             
         Returns:
-            Indices of the winners from each tournament [pop_size]
+            MLX array of indices of the winners from each tournament [pop_size]
         """
         # Pre-allocate memory for all tournaments at once [pop_size, tournament_size]
-        tournament_indices = torch.randint(
+        tournament_indices = mx.random.randint(
             0, self.pop_size, 
-            (self.pop_size, self.tournament_size), 
-            device=self.device
+            shape=(self.pop_size, self.tournament_size)
         )
         
-        # Use advanced indexing to get fitness of all participants in one operation
-        tournament_fitness = fitness[tournament_indices]
+        # Create empty array to store results
+        winner_indices = mx.zeros((self.pop_size,), dtype=mx.int32)
         
-        # Find winners using argmax (highest fitness) in each tournament
-        winner_relative_indices = torch.argmax(tournament_fitness, dim=1)
+        # We need to use a loop since MLX doesn't have advanced indexing like PyTorch's gather
+        for i in range(self.pop_size):
+            # Get the indices for this tournament
+            indices = tournament_indices[i]
+            
+            # Get fitness values for these indices
+            tournament_fitness = mx.array([fitness[idx] for idx in indices])
+            
+            # Find winner (highest fitness)
+            winner_pos = mx.argmax(tournament_fitness)
+            
+            # Get the actual index from tournament_indices
+            # Fix: Get the integer value directly to avoid tuple creation
+            winner_indices[i] = int(indices[winner_pos].item())
         
-        # Get actual population indices of winners using gather
-        return tournament_indices.gather(1, winner_relative_indices.unsqueeze(1)).squeeze(1)
+        return winner_indices
 
-    def selection_and_reproduction(self, fitness: torch.Tensor) -> None:
+    def selection_and_reproduction(self, fitness: mx.array) -> None:
         """
         Performs selection, reproduction and mutation to create the next generation
-        using fully batched tensor operations.
+        using fully batched array operations.
         
         Args:
-            fitness: A tensor containing the fitness values for each agent in the population.
+            fitness: An array containing the fitness values for each agent in the population.
         """
         try:
             # Calculate how many elite agents to keep
             num_elite = max(1, int(self.elitism * self.pop_size) if isinstance(self.elitism, float) else self.elitism)
             
-            # Get indices of agents with top fitness
-            _, elite_indices = torch.topk(fitness, num_elite)
+            # Get indices of agents with top fitness - fix for MLX's argsort behavior
+            sorted_indices = mx.argsort(fitness)
+            elite_indices = sorted_indices[-num_elite:]
             
             # Select parents through tournament selection (fully vectorized)
             parent_indices = self._vectorized_tournament_selection(fitness)
             
             # Create new population by copying parameters from parents in a single batch operation
-            for layer_idx in range(self.agents.model.n_layers):
+            for layer_idx in range(len(self.agents.policy_net.layers)):
                 # Get all weights and biases for this layer
                 weights, biases = self.agents.get_layer_parameters(layer_idx)
                 
@@ -766,99 +823,105 @@ class TensorEvolution:
                 new_biases = biases[parent_indices]
                 
                 # Apply mutations to all agents at once
-                with torch.no_grad():
-                    # Mutation mask (True where mutation should occur)
-                    weight_mutation_mask = torch.rand_like(new_weights) < self.mutation_rate
-                    bias_mutation_mask = torch.rand_like(new_biases) < self.mutation_rate
-                    
-                    # Create Gaussian noise for mutations, matching the shape of weights and biases
-                    weight_mutations = torch.randn_like(new_weights) * 0.1
-                    bias_mutations = torch.randn_like(new_biases) * 0.1
-                    
-                    # Apply mutations using tensor operations
-                    new_weights = new_weights + (weight_mutation_mask * weight_mutations)
-                    new_biases = new_biases + (bias_mutation_mask * bias_mutations)
-                    
-                    # Preserve elite agents' parameters
-                    if num_elite > 0:
-                        # Use advanced indexing to copy parameters from elite agents back to elite positions
-                        # This replaces mutations for the elite agents
-                        new_weights[:num_elite] = weights[elite_indices]
-                        new_biases[:num_elite] = biases[elite_indices]
-                    
-                    # Update the layer with new parameters (entire population at once)
-                    self.agents.set_layer_parameters(layer_idx, new_weights, new_biases)
+                # Mutation mask (True where mutation should occur)
+                weight_mutation_mask = mx.random.uniform(shape=new_weights.shape) < self.mutation_rate
+                bias_mutation_mask = mx.random.uniform(shape=new_biases.shape) < self.mutation_rate
+                
+                # Create Gaussian noise for mutations, matching the shape of weights and biases
+                weight_mutations = mx.random.normal(shape=new_weights.shape) * 0.1
+                bias_mutations = mx.random.normal(shape=new_biases.shape) * 0.1
+                
+                # Apply mutations using array operations
+                new_weights = new_weights + (weight_mutation_mask * weight_mutations)
+                new_biases = new_biases + (bias_mutation_mask * bias_mutations)
+                
+                # Preserve elite agents' parameters
+                if num_elite > 0:
+                    # Use advanced indexing to copy parameters from elite agents back to elite positions
+                    # This replaces mutations for the elite agents
+                    new_weights[:num_elite] = weights[elite_indices]
+                    new_biases[:num_elite] = biases[elite_indices]
+                
+                # Update the layer with new parameters (entire population at once)
+                self.agents.set_layer_parameters(layer_idx, new_weights, new_biases)
             
             # Handle output layer separately but still in a fully batched manner
             out_weights, out_biases = self.agents.get_output_parameters()
             new_out_weights = out_weights[parent_indices]
             new_out_biases = out_biases[parent_indices]
             
-            with torch.no_grad():
-                # Mutation mask for output layer
-                out_weight_mutation_mask = torch.rand_like(new_out_weights) < self.mutation_rate
-                out_bias_mutation_mask = torch.rand_like(new_out_biases) < self.mutation_rate
-                
-                # Create Gaussian noise for mutations
-                out_weight_mutations = torch.randn_like(new_out_weights) * 0.1
-                out_bias_mutations = torch.randn_like(new_out_biases) * 0.1
-                
-                # Apply mutations using tensor operations
-                new_out_weights = new_out_weights + (out_weight_mutation_mask * out_weight_mutations)
-                new_out_biases = new_out_biases + (out_bias_mutation_mask * out_bias_mutations)
-                
-                # Preserve elite agents' parameters
-                if num_elite > 0:
-                    new_out_weights[:num_elite] = out_weights[elite_indices]
-                    new_out_biases[:num_elite] = out_biases[elite_indices]
-                
-                # Update output layer parameters (entire population at once)
-                self.agents.set_output_parameters(new_out_weights, new_out_biases)
+            # Mutation mask for output layer
+            out_weight_mutation_mask = mx.random.uniform(shape=new_out_weights.shape) < self.mutation_rate
+            out_bias_mutation_mask = mx.random.uniform(shape=new_out_biases.shape) < self.mutation_rate
+            
+            # Create Gaussian noise for mutations
+            out_weight_mutations = mx.random.normal(shape=new_out_weights.shape) * 0.1
+            out_bias_mutations = mx.random.normal(shape=new_out_biases.shape) * 0.1
+            
+            # Apply mutations using array operations
+            new_out_weights = new_out_weights + (out_weight_mutation_mask * out_weight_mutations)
+            new_out_biases = new_out_biases + (out_bias_mutation_mask * out_bias_mutations)
+            
+            # Preserve elite agents' parameters
+            if num_elite > 0:
+                new_out_weights[:num_elite] = out_weights[elite_indices]
+                new_out_biases[:num_elite] = out_biases[elite_indices]
+            
+            # Update output layer parameters (entire population at once)
+            self.agents.set_output_parameters(new_out_weights, new_out_biases)
             
             # Handle evolvable energy parameters if they exist
             if hasattr(self.agents, 'evolvable_energy') and self.agents.evolvable_energy:
-                # Copy energy genes from parents
-                new_energy_efficiency = self.agents.energy_efficiency[parent_indices]
-                new_learn_probability = self.agents.learn_probability[parent_indices]
-                new_recovery_rate = self.agents.recovery_rate[parent_indices]
+                # Check if the energy efficiency attributes exist before using them
+                has_energy_params = (hasattr(self.agents, 'energy_efficiency') and 
+                                    hasattr(self.agents, 'learn_probability') and
+                                    hasattr(self.agents, 'recovery_rate'))
                 
-                # Apply mutations
-                efficiency_mutation_mask = torch.rand_like(new_energy_efficiency) < self.mutation_rate
-                learn_prob_mutation_mask = torch.rand_like(new_learn_probability) < self.mutation_rate
-                recovery_mutation_mask = torch.rand_like(new_recovery_rate) < self.mutation_rate
-                
-                # Create mutations
-                efficiency_mutations = 0.1 * torch.randn_like(new_energy_efficiency)
-                learn_prob_mutations = 0.02 * torch.randn_like(new_learn_probability)
-                recovery_mutations = 0.005 * torch.randn_like(new_recovery_rate)
-                
-                # Apply mutations
-                new_energy_efficiency = new_energy_efficiency + (efficiency_mutation_mask * efficiency_mutations)
-                new_learn_probability = new_learn_probability + (learn_prob_mutation_mask * learn_prob_mutations)
-                new_recovery_rate = new_recovery_rate + (recovery_mutation_mask * recovery_mutations)
-                
-                # Preserve elite genes
-                if num_elite > 0:
-                    new_energy_efficiency[:num_elite] = self.agents.energy_efficiency[elite_indices]
-                    new_learn_probability[:num_elite] = self.agents.learn_probability[elite_indices]
-                    new_recovery_rate[:num_elite] = self.agents.recovery_rate[elite_indices]
-                
-                # Ensure valid values
-                new_energy_efficiency = torch.clamp(new_energy_efficiency, min=0.5, max=1.5)
-                new_learn_probability = torch.clamp(new_learn_probability, min=0.01, max=0.3)
-                new_recovery_rate = torch.clamp(new_recovery_rate, min=0.005, max=0.1)
-                
-                # Update agent's energy genes
-                self.agents.energy_efficiency = new_energy_efficiency
-                self.agents.learn_probability = new_learn_probability
-                self.agents.recovery_rate = new_recovery_rate
-                
-                # Update derived values
-                self.agents.energy_cost_predict = torch.full((self.pop_size,), self.agents.base_energy_cost_predict, 
-                                                          device=self.device) / self.agents.energy_efficiency
-                self.agents.energy_cost_learn = torch.full((self.pop_size,), self.agents.base_energy_cost_learn, 
-                                                        device=self.device) / self.agents.energy_efficiency
-                self.agents.energy_recovery = self.agents.recovery_rate
+                if has_energy_params:
+                    # Copy energy genes from parents
+                    new_energy_efficiency = self.agents.energy_efficiency[parent_indices]
+                    new_learn_probability = self.agents.learn_probability[parent_indices]
+                    new_recovery_rate = self.agents.recovery_rate[parent_indices]
+                    
+                    # Apply mutations
+                    efficiency_mutation_mask = mx.random.uniform(shape=new_energy_efficiency.shape) < self.mutation_rate
+                    learn_prob_mutation_mask = mx.random.uniform(shape=new_learn_probability.shape) < self.mutation_rate
+                    recovery_mutation_mask = mx.random.uniform(shape=new_recovery_rate.shape) < self.mutation_rate
+                    
+                    # Create mutations
+                    efficiency_mutations = 0.1 * mx.random.normal(shape=new_energy_efficiency.shape)
+                    learn_prob_mutations = 0.02 * mx.random.normal(shape=new_learn_probability.shape)
+                    recovery_mutations = 0.005 * mx.random.normal(shape=new_recovery_rate.shape)
+                    
+                    # Apply mutations
+                    new_energy_efficiency = new_energy_efficiency + (efficiency_mutation_mask * efficiency_mutations)
+                    new_learn_probability = new_learn_probability + (learn_prob_mutation_mask * learn_prob_mutations)
+                    new_recovery_rate = new_recovery_rate + (recovery_mutation_mask * recovery_mutations)
+                    
+                    # Preserve elite genes
+                    if num_elite > 0:
+                        new_energy_efficiency[:num_elite] = self.agents.energy_efficiency[elite_indices]
+                        new_learn_probability[:num_elite] = self.agents.learn_probability[elite_indices]
+                        new_recovery_rate[:num_elite] = self.agents.recovery_rate[elite_indices]
+                    
+                    # Ensure valid values
+                    new_energy_efficiency = mx.clip(new_energy_efficiency, 0.5, 1.5)
+                    new_learn_probability = mx.clip(new_learn_probability, 0.01, 0.3)
+                    new_recovery_rate = mx.clip(new_recovery_rate, 0.005, 0.1)
+                    
+                    # Update agent's energy genes
+                    self.agents.energy_efficiency = new_energy_efficiency
+                    self.agents.learn_probability = new_learn_probability
+                    self.agents.recovery_rate = new_recovery_rate
+                    
+                    # Update derived values
+                    self.agents.energy_cost_predict = mx.full((self.pop_size,), self.agents.base_energy_cost_predict) / new_energy_efficiency
+                    self.agents.energy_cost_learn = mx.full((self.pop_size,), self.agents.base_energy_cost_learn) / new_energy_efficiency
+                    self.agents.energy_recovery = new_recovery_rate
+                else:
+                    # Evolution of energy parameters is enabled, but parameters don't exist yet
+                    # This might happen on first initialization - we could initialize them here
+                    logger.info("Evolvable energy is enabled but energy parameters are not initialized. Creating defaults.")
             
             # Reset agent state variables for next generation
             self.agents.reset_state()
@@ -867,7 +930,7 @@ class TensorEvolution:
             logger.error(f"Error in selection and reproduction: {str(e)}")
             traceback.print_exc()
 
-    def run_generation(self, steps: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run_generation(self, steps: int) -> Tuple[mx.array, mx.array]:
         """
         Run a single generation of the evolutionary algorithm.
         
@@ -875,7 +938,7 @@ class TensorEvolution:
             steps: Number of steps to run
             
         Returns:
-            Tuple of (fitness_tensor, lci_tensor)
+            Tuple of (fitness_array, lci_array)
         """
         # Store the current steps_per_generation
         original_steps = self.steps_per_generation
@@ -885,8 +948,8 @@ class TensorEvolution:
         fitness, lci_values = self.evaluate_fitness()
         
         # Track the best agent (moved to _calculate_final_fitness)
-        best_idx = torch.argmax(fitness).item()
-        best_fitness_gen = fitness[best_idx].item()
+        best_idx = mx.argmax(fitness).item()
+        best_fitness_gen = fitness[best_idx]
         
         if best_fitness_gen > self.best_fitness:
             self.best_fitness = best_fitness_gen
@@ -1053,6 +1116,14 @@ class TensorEvolution:
         """
         Save the results to a JSON file.
         """
+        # Create MLX array encoder class for JSON serialization
+        class MLXArrayEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, mx.array):
+                    # Convert MLX array to list for serialization
+                    return obj.tolist()
+                return super().default(obj)
+                
         results = {
             'parameters': {
                 'pop_size': self.pop_size,
@@ -1078,23 +1149,23 @@ class TensorEvolution:
             results['step_energy_tracking'] = self.step_energy_tracking
         
         with open(f"{self.output_dir}/results.json", 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, cls=MLXArrayEncoder)
 
     def _zeros_like_population(self):
-        """Create a zero tensor with population size on the correct device."""
-        return torch.zeros(self.pop_size, device=self.device)
+        """Create a zero array with population size."""
+        return mx.zeros((self.pop_size,))
     
     def _ones_like_population(self):
-        """Create a ones tensor with population size on the correct device."""
-        return torch.ones(self.pop_size, device=self.device)
+        """Create a ones array with population size."""
+        return mx.ones((self.pop_size,))
 
     def _get_scalar_energy_value(self, energy_param):
-        """Get a scalar value from an energy parameter that could be either a tensor or a scalar."""
-        if isinstance(energy_param, torch.Tensor):
-            # If it's a tensor with multiple values (one per agent), use the mean
-            if energy_param.numel() > 1:
-                return energy_param.mean().item()
-            # If it's a single value tensor, just get the item
+        """Get a scalar value from an energy parameter that could be either an array or a scalar."""
+        if hasattr(energy_param, 'shape'):
+            # If it's an array with multiple values (one per agent), use the mean
+            if len(energy_param.shape) > 0 and energy_param.size > 1:
+                return mx.mean(energy_param).item()
+            # If it's a single value array, just get the item
             return energy_param.item()
         # If it's already a scalar, return it directly
         return energy_param

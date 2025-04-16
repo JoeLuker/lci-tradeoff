@@ -64,21 +64,3 @@ The implementation consists of these key components:
 2. **Neural Population** (`NeuralPopulation`): Manages a population of neural networks that share architecture but have individual weights, enabling parallel forward and backward passes
 
 3. **Tensor Evolution** (`TensorEvolution`): Implements evolutionary algorithms using tensor operations for selection, crossover, and fitness evaluation
-
-## Performance Characteristics
-
-The tensor-based implementation typically achieves:
-- 10-50x speedup for small populations (50-100 agents)
-- 50-200x speedup for large populations (500+ agents)
-
-This allows for:
-- Running larger populations
-- More generations
-- More complex environments
-- More thorough hyperparameter searches
-
-## Limitations
-
-- Memory usage is higher than non-vectorized implementations
-- Device transfers can be a bottleneck for very small populations
-- Debugging can be more complex due to the vectorized nature

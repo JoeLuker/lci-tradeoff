@@ -4,7 +4,7 @@ Visualization Utilities
 This module provides functions for visualizing LCI experiment results.
 """
 
-import numpy as np
+import mlx.core as mx
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import List, Dict, Tuple, Any, Optional
@@ -124,11 +124,13 @@ def plot_lci_space(
     # Plot points
     if fitness_values:
         # Normalize fitness for color mapping
-        norm_fitness = np.array(fitness_values)
-        if np.max(norm_fitness) > np.min(norm_fitness):
-            norm_fitness = (norm_fitness - np.min(norm_fitness)) / (np.max(norm_fitness) - np.min(norm_fitness))
+        norm_fitness = mx.array(fitness_values)
+        if mx.max(norm_fitness) > mx.min(norm_fitness):
+            norm_fitness = (norm_fitness - mx.min(norm_fitness)) / (mx.max(norm_fitness) - mx.min(norm_fitness))
         
-        scatter = ax.scatter(L, C, I, c=norm_fitness, cmap='viridis', s=50, alpha=0.7)
+        # Convert to python list for matplotlib
+        norm_fitness_list = [f.item() for f in norm_fitness]
+        scatter = ax.scatter(L, C, I, c=norm_fitness_list, cmap='viridis', s=50, alpha=0.7)
         plt.colorbar(scatter, label='Normalized Fitness')
     else:
         ax.scatter(L, C, I, c='blue', s=50, alpha=0.7)
@@ -143,7 +145,7 @@ def plot_lci_space(
     if max(max(L), max(C), max(I)) > 0:
         line_max = max(max(L), max(C), max(I))
         line_min = min(min(L), min(C), min(I))
-        balanced_line = np.linspace(line_min, line_max, 100)
+        balanced_line = mx.linspace(line_min, line_max, 100).tolist()
         ax.plot(balanced_line, balanced_line, balanced_line, 'r-', label='L=C=I (Optimal Balance)')
         plt.legend()
     
@@ -177,7 +179,12 @@ def plot_lci_balance_distribution(
     plt.figure(figsize=(10, 6))
     
     sns.histplot(balance_values, bins=20, kde=True)
-    plt.axvline(np.mean(balance_values), color='r', linestyle='--', label=f'Mean: {np.mean(balance_values):.3f}')
+    
+    # Convert to MLX array for computation
+    balance_mx = mx.array(balance_values)
+    mean_balance = mx.mean(balance_mx).item()
+    
+    plt.axvline(mean_balance, color='r', linestyle='--', label=f'Mean: {mean_balance:.3f}')
     
     plt.title('Distribution of LCI Balance Values')
     plt.xlabel('LCI Balance Score')
@@ -262,75 +269,86 @@ def create_summary_dashboard(
     identifier: str = "summary"
 ):
     """
-    Create a comprehensive dashboard of visualization results
+    Create a summary dashboard with multiple plots
     
     Args:
         fitness_history: List of fitness values per generation
         lci_history: List of (L, C, I) tuples per generation
         agents: List of agent objects
         best_agent: Best performing agent
-        output_dir: Directory to save outputs
-        identifier: Identifier string for output files
+        output_dir: Directory to save the plots
+        identifier: Identifier to append to filenames
     """
+    # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Create a multi-panel figure
-    set_plot_style()
-    plt.figure(figsize=(18, 12))
+    # Plot fitness history
+    plot_fitness_history(
+        fitness_history,
+        save_path=f"{output_dir}/fitness_history_{identifier}.png",
+        show=False
+    )
     
-    # Plot 1: Fitness History
-    plt.subplot(2, 2, 1)
-    plt.plot(fitness_history)
-    plt.title('Average Fitness Over Generations')
-    plt.xlabel('Generation')
-    plt.ylabel('Fitness')
+    # Plot LCI parameters
+    plot_lci_parameters(
+        lci_history,
+        save_path=f"{output_dir}/lci_parameters_{identifier}.png",
+        show=False
+    )
     
-    # Plot 2: LCI Parameters Over Time
-    plt.subplot(2, 2, 2)
-    L_values, C_values, I_values = zip(*lci_history)
-    plt.plot(L_values, 'r-', label='L')
-    plt.plot(C_values, 'g-', label='C')
-    plt.plot(I_values, 'b-', label='I')
-    plt.title('LCI Parameters Over Generations')
-    plt.xlabel('Generation')
-    plt.ylabel('Value')
-    plt.legend()
+    # Prepare LCI data for plotting
+    agents_lci = []
+    fitness_values = []
+    balance_values = []
     
-    # Plot 3: Final Population in L-C Space (with I as color)
-    plt.subplot(2, 2, 3)
-    L = [agent.lci_params["L"] for agent in agents]
-    C = [agent.lci_params["C"] for agent in agents]
-    I = [agent.lci_params["I"] for agent in agents]
+    for agent in agents:
+        # Extract LCI values
+        # Assuming agent has get_lci_values method that returns L, C, I values
+        if hasattr(agent, 'get_lci_values'):
+            L, C, I = agent.get_lci_values()
+            agents_lci.append({"L": L, "C": C, "I": I})
+            
+            # Calculate balance as the inverse of variance between normalized L, C, I
+            # Higher balance = lower variance
+            lci_mx = mx.array([L, C, I])
+            if mx.max(lci_mx) > 0:
+                norm_lci = lci_mx / mx.max(lci_mx)
+                balance = 1.0 - mx.var(norm_lci).item()
+                balance_values.append(balance)
+            
+            # Get fitness
+            if hasattr(agent, 'get_fitness'):
+                fitness_values.append(agent.get_fitness())
     
-    scatter = plt.scatter(L, C, c=I, cmap='viridis', alpha=0.7)
-    plt.colorbar(scatter, label='I Value')
-    plt.title('Final Population in L-C Space')
-    plt.xlabel('L (Losslessness)')
-    plt.ylabel('C (Compression)')
+    # Plot LCI space
+    if agents_lci and fitness_values:
+        plot_lci_space(
+            agents_lci,
+            fitness_values=fitness_values,
+            save_path=f"{output_dir}/lci_space_{identifier}.png",
+            show=False
+        )
     
-    # Highlight best agent
-    best_L = best_agent.lci_params["L"]
-    best_C = best_agent.lci_params["C"]
-    plt.scatter([best_L], [best_C], c='red', s=100, marker='*', label='Best Agent')
-    plt.legend()
+    # Plot LCI balance distribution
+    if balance_values:
+        plot_lci_balance_distribution(
+            balance_values,
+            save_path=f"{output_dir}/lci_balance_{identifier}.png",
+            show=False
+        )
     
-    # Plot 4: LCI Balance Distribution
-    plt.subplot(2, 2, 4)
-    balance_values = [agent.get_lci_balance() for agent in agents]
-    plt.hist(balance_values, bins=20)
-    plt.axvline(best_agent.get_lci_balance(), color='r', linestyle='--', 
-                label=f'Best Agent: {best_agent.get_lci_balance():.3f}')
-    plt.title('LCI Balance Distribution')
-    plt.xlabel('LCI Balance')
-    plt.ylabel('Count')
-    plt.legend()
+    # Plot best agent's learning curve if available
+    if hasattr(best_agent, 'get_learning_curve'):
+        learning_curve = best_agent.get_learning_curve()
+        if learning_curve:
+            set_plot_style()
+            plt.figure(figsize=(10, 6))
+            plt.plot(learning_curve)
+            plt.title(f'Best Agent Learning Curve')
+            plt.xlabel('Training Step')
+            plt.ylabel('Performance')
+            plt.grid(True)
+            plt.savefig(f"{output_dir}/best_agent_learning_{identifier}.png")
+            plt.close()
     
-    # Save the dashboard
-    plt.tight_layout()
-    dashboard_path = os.path.join(output_dir, f"dashboard_{identifier}.png")
-    plt.savefig(dashboard_path)
-    plt.close()
-    
-    logger.info(f"Created summary dashboard: {dashboard_path}")
-    
-    return dashboard_path 
+    logger.info(f"Created summary dashboard in {output_dir}") 

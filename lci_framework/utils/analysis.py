@@ -4,13 +4,11 @@ Analysis Utilities
 This module provides functions for analyzing LCI experiment results.
 """
 
-import numpy as np
-import pandas as pd
+import mlx.core as mx
 from typing import List, Dict, Tuple, Any, Optional
 import json
 import os
 import logging
-from scipy import stats
 from pathlib import Path
 
 # Configure logger
@@ -19,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def calculate_summary_statistics(data: List[float]) -> Dict[str, float]:
     """
-    Calculate summary statistics for a dataset
+    Calculate summary statistics for a dataset using MLX
     
     Args:
         data: List of numeric values
@@ -37,15 +35,42 @@ def calculate_summary_statistics(data: List[float]) -> Dict[str, float]:
             "q1": None,
             "q3": None
         }
-        
+    
+    # Convert to MLX array
+    data_mx = mx.array(data)
+    
+    # Calculate basic statistics
+    mean = mx.mean(data_mx).item()
+    std = mx.std(data_mx).item()
+    min_val = mx.min(data_mx).item()
+    max_val = mx.max(data_mx).item()
+    
+    # Sort data for percentiles
+    sorted_data = mx.sort(data_mx)
+    n = len(data)
+    
+    # Calculate median (50th percentile)
+    if n % 2 == 0:
+        # Even number of elements
+        median = (sorted_data[n//2 - 1] + sorted_data[n//2]).item() / 2
+    else:
+        # Odd number of elements
+        median = sorted_data[n//2].item()
+    
+    # Calculate Q1 (25th percentile) and Q3 (75th percentile)
+    q1_idx = int(n * 0.25)
+    q3_idx = int(n * 0.75)
+    q1 = sorted_data[q1_idx].item()
+    q3 = sorted_data[q3_idx].item()
+    
     return {
-        "mean": float(np.mean(data)),
-        "median": float(np.median(data)),
-        "std": float(np.std(data)),
-        "min": float(np.min(data)),
-        "max": float(np.max(data)),
-        "q1": float(np.percentile(data, 25)),
-        "q3": float(np.percentile(data, 75))
+        "mean": float(mean),
+        "median": float(median),
+        "std": float(std),
+        "min": float(min_val),
+        "max": float(max_val),
+        "q1": float(q1),
+        "q3": float(q3)
     }
 
 
@@ -67,18 +92,50 @@ def analyze_fitness_progression(fitness_history: List[float]) -> Dict[str, Any]:
     stats = calculate_summary_statistics(fitness_history)
     
     # Calculate improvement rate (linear regression slope)
-    generations = np.arange(len(fitness_history))
-    slope, intercept, r_value, p_value, std_err = stats.linregress(generations, fitness_history)
+    # y = mx + b
+    # Use MLX for linear regression calculations
+    generations = mx.array(range(len(fitness_history)))
+    fitness_mx = mx.array(fitness_history)
+    
+    n = len(fitness_history)
+    mean_x = mx.mean(generations).item()
+    mean_y = mx.mean(fitness_mx).item()
+    
+    # Calculate slope: m = sum((x_i - mean_x) * (y_i - mean_y)) / sum((x_i - mean_x)^2)
+    numerator = mx.sum((generations - mean_x) * (fitness_mx - mean_y)).item()
+    denominator = mx.sum((generations - mean_x) ** 2).item()
+    
+    if denominator != 0:
+        slope = numerator / denominator
+        intercept = mean_y - slope * mean_x
+        
+        # Calculate r^2
+        y_pred = slope * generations + intercept
+        ss_total = mx.sum((fitness_mx - mean_y) ** 2).item()
+        ss_residual = mx.sum((fitness_mx - y_pred) ** 2).item()
+        
+        if ss_total != 0:
+            r_squared = 1 - (ss_residual / ss_total)
+        else:
+            r_squared = 0
+    else:
+        slope = 0
+        intercept = mean_y
+        r_squared = 0
     
     # Calculate convergence (when fitness stabilizes)
     # Simple heuristic: when the improvement is less than 1% for 5 consecutive generations
     convergence_gen = None
     for i in range(5, len(fitness_history)):
-        window = fitness_history[i-5:i]
-        improvement = (fitness_history[i] - window[0]) / max(0.0001, window[0])
-        if abs(improvement) < 0.01:
-            convergence_gen = i - 5
-            break
+        window = mx.array(fitness_history[i-5:i])
+        window_start = window[0].item()
+        current = fitness_history[i]
+        
+        if window_start != 0:
+            improvement = (current - window_start) / abs(window_start)
+            if abs(improvement) < 0.01:
+                convergence_gen = i - 5
+                break
     
     # Calculate early vs late phase statistics
     early_phase = fitness_history[:len(fitness_history)//3]
@@ -92,15 +149,14 @@ def analyze_fitness_progression(fitness_history: List[float]) -> Dict[str, Any]:
         "early_phase_stats": early_stats,
         "late_phase_stats": late_stats,
         "improvement_rate": float(slope),
-        "r_squared": float(r_value ** 2),
-        "p_value": float(p_value),
+        "r_squared": float(r_squared),
         "convergence_generation": convergence_gen
     }
 
 
 def analyze_lci_balance(agents_lci_balance: List[float]) -> Dict[str, Any]:
     """
-    Analyze LCI balance distribution
+    Analyze LCI balance distribution using MLX
     
     Args:
         agents_lci_balance: List of LCI balance values
@@ -115,30 +171,53 @@ def analyze_lci_balance(agents_lci_balance: List[float]) -> Dict[str, Any]:
     # Basic statistics
     stats = calculate_summary_statistics(agents_lci_balance)
     
-    # Calculate skewness and kurtosis
-    skewness = float(stats.skew(agents_lci_balance))
-    kurtosis = float(stats.kurtosis(agents_lci_balance))
+    # Convert to MLX array
+    balance_mx = mx.array(agents_lci_balance)
     
-    # Test for normality
-    shapiro_stat, shapiro_p = stats.shapiro(agents_lci_balance)
+    # Calculate mean, variance for further calculations
+    mean = mx.mean(balance_mx).item()
+    var = mx.var(balance_mx).item()
+    n = len(agents_lci_balance)
     
-    # Calculate percentile ranks
+    # Calculate skewness (3rd moment)
+    # skewness = E[(X - μ)³] / σ³
+    if var > 0:
+        m3 = mx.mean((balance_mx - mean) ** 3).item()
+        skewness = m3 / (var ** 1.5)
+    else:
+        skewness = 0.0
+    
+    # Calculate kurtosis (4th moment)
+    # kurtosis = E[(X - μ)⁴] / σ⁴ - 3
+    if var > 0:
+        m4 = mx.mean((balance_mx - mean) ** 4).item()
+        kurtosis = m4 / (var ** 2) - 3
+    else:
+        kurtosis = 0.0
+    
+    # We can't do a Shapiro-Wilk test with MLX directly
+    # Instead, we'll use a simpler normality check based on skewness and kurtosis
+    is_normal = abs(skewness) < 1.0 and abs(kurtosis) < 1.0
+    
+    # Calculate percentile ranks using sorted array
+    sorted_balance = mx.sort(balance_mx)
+    
     percentiles = {
-        "10th": float(np.percentile(agents_lci_balance, 10)),
-        "25th": float(np.percentile(agents_lci_balance, 25)),
-        "50th": float(np.percentile(agents_lci_balance, 50)),
-        "75th": float(np.percentile(agents_lci_balance, 75)),
-        "90th": float(np.percentile(agents_lci_balance, 90))
+        "10th": float(sorted_balance[int(n * 0.1)].item()),
+        "25th": float(sorted_balance[int(n * 0.25)].item()),
+        "50th": float(sorted_balance[int(n * 0.5)].item()),
+        "75th": float(sorted_balance[int(n * 0.75)].item()),
+        "90th": float(sorted_balance[int(n * 0.9)].item())
     }
     
     return {
         "basic_stats": stats,
-        "skewness": skewness,
-        "kurtosis": kurtosis,
-        "normality_test": {
-            "shapiro_stat": float(shapiro_stat),
-            "shapiro_p": float(shapiro_p),
-            "is_normal": shapiro_p > 0.05
+        "skewness": float(skewness),
+        "kurtosis": float(kurtosis),
+        "normality_check": {
+            "is_normal": is_normal,
+            "skewness": float(skewness),
+            "kurtosis": float(kurtosis)
         },
         "percentiles": percentiles
     }
@@ -146,7 +225,7 @@ def analyze_lci_balance(agents_lci_balance: List[float]) -> Dict[str, Any]:
 
 def analyze_lci_evolution(lci_history: List[Tuple[float, float, float]]) -> Dict[str, Any]:
     """
-    Analyze how LCI parameters evolve over generations
+    Analyze how LCI parameters evolve over generations using MLX
     
     Args:
         lci_history: List of (L, C, I) tuples per generation
@@ -158,8 +237,8 @@ def analyze_lci_evolution(lci_history: List[Tuple[float, float, float]]) -> Dict
         logger.warning("No data for LCI evolution analysis")
         return {"error": "No data"}
     
-    # Convert to numpy array for easier manipulation
-    lci_array = np.array(lci_history)
+    # Convert to MLX array for easier manipulation
+    lci_array = mx.array(lci_history)
     
     # Extract separate L, C, I histories
     L_history = lci_array[:, 0]
@@ -167,37 +246,45 @@ def analyze_lci_evolution(lci_history: List[Tuple[float, float, float]]) -> Dict
     I_history = lci_array[:, 2]
     
     # Calculate statistics for each parameter
-    L_stats = calculate_summary_statistics(L_history)
-    C_stats = calculate_summary_statistics(C_history)
-    I_stats = calculate_summary_statistics(I_history)
+    L_stats = calculate_summary_statistics([l.item() for l in L_history])
+    C_stats = calculate_summary_statistics([c.item() for c in C_history])
+    I_stats = calculate_summary_statistics([i.item() for i in I_history])
     
-    # Calculate parameter trends
-    generations = np.arange(len(lci_history))
+    # Calculate parameter trends using linear regression
+    generations = mx.array(range(len(lci_history)))
     
-    L_slope, _, L_r_value, L_p_value, _ = stats.linregress(generations, L_history)
-    C_slope, _, C_r_value, C_p_value, _ = stats.linregress(generations, C_history)
-    I_slope, _, I_r_value, I_p_value, _ = stats.linregress(generations, I_history)
+    # Calculate trends for L
+    l_slope, l_r_squared = _calculate_linear_trend(generations, L_history)
+    
+    # Calculate trends for C
+    c_slope, c_r_squared = _calculate_linear_trend(generations, C_history)
+    
+    # Calculate trends for I
+    i_slope, i_r_squared = _calculate_linear_trend(generations, I_history)
     
     # Calculate balance convergence - how parameters converge to similar values
     # Lower values indicate more balanced L,C,I parameters
     balance_divergence = []
-    for l, c, i in lci_history:
+    for gen_idx in range(len(lci_history)):
+        # Get L, C, I for this generation
+        l, c, i = lci_array[gen_idx].tolist()
+        
         # Calculate variance of normalized parameters
-        params = np.array([l, c, i])
-        if np.max(params) > 0:
-            norm_params = params / np.max(params)
-            divergence = np.var(norm_params)
+        params = mx.array([l, c, i])
+        if mx.max(params) > 0:
+            norm_params = params / mx.max(params)
+            divergence = mx.var(norm_params).item()
             balance_divergence.append(divergence)
     
     balance_trend = None
     if balance_divergence:
-        balance_slope, _, balance_r_value, balance_p_value, _ = stats.linregress(
-            generations[-len(balance_divergence):], balance_divergence
-        )
+        balance_gen = mx.array(range(len(balance_divergence)))
+        balance_div = mx.array(balance_divergence)
+        balance_slope, balance_r_squared = _calculate_linear_trend(balance_gen, balance_div)
+        
         balance_trend = {
             "slope": float(balance_slope),
-            "r_squared": float(balance_r_value ** 2),
-            "p_value": float(balance_p_value)
+            "r_squared": float(balance_r_squared)
         }
     
     return {
@@ -206,23 +293,58 @@ def analyze_lci_evolution(lci_history: List[Tuple[float, float, float]]) -> Dict
         "I_stats": I_stats,
         "trends": {
             "L_trend": {
-                "slope": float(L_slope),
-                "r_squared": float(L_r_value ** 2),
-                "p_value": float(L_p_value)
+                "slope": float(l_slope),
+                "r_squared": float(l_r_squared)
             },
             "C_trend": {
-                "slope": float(C_slope),
-                "r_squared": float(C_r_value ** 2),
-                "p_value": float(C_p_value)
+                "slope": float(c_slope),
+                "r_squared": float(c_r_squared)
             },
             "I_trend": {
-                "slope": float(I_slope),
-                "r_squared": float(I_r_value ** 2),
-                "p_value": float(I_p_value)
+                "slope": float(i_slope),
+                "r_squared": float(i_r_squared)
             }
         },
         "balance_trend": balance_trend
     }
+
+
+def _calculate_linear_trend(x: mx.array, y: mx.array) -> Tuple[float, float]:
+    """
+    Calculate linear regression using MLX
+    
+    Args:
+        x: Independent variable
+        y: Dependent variable
+        
+    Returns:
+        Tuple of (slope, r_squared)
+    """
+    mean_x = mx.mean(x).item()
+    mean_y = mx.mean(y).item()
+    
+    # Calculate slope: m = sum((x_i - mean_x) * (y_i - mean_y)) / sum((x_i - mean_x)^2)
+    numerator = mx.sum((x - mean_x) * (y - mean_y)).item()
+    denominator = mx.sum((x - mean_x) ** 2).item()
+    
+    if denominator != 0:
+        slope = numerator / denominator
+        intercept = mean_y - slope * mean_x
+        
+        # Calculate r^2
+        y_pred = slope * x + intercept
+        ss_total = mx.sum((y - mean_y) ** 2).item()
+        ss_residual = mx.sum((y - y_pred) ** 2).item()
+        
+        if ss_total != 0:
+            r_squared = 1 - (ss_residual / ss_total)
+        else:
+            r_squared = 0
+    else:
+        slope = 0
+        r_squared = 0
+    
+    return slope, r_squared
 
 
 def analyze_environmental_response(
@@ -247,69 +369,104 @@ def analyze_environmental_response(
         logger.warning("Volatility and performance histories must have the same length")
         return {"error": "Data length mismatch"}
     
-    # Calculate correlation between volatility and performance
-    correlation, p_value = stats.pearsonr(volatility_history, performance_history)
+    # Convert to MLX arrays
+    vol_mx = mx.array(volatility_history)
+    perf_mx = mx.array(performance_history)
     
-    # Analyze lag effects - how performance changes after volatility changes
+    # Calculate correlation
+    # r = cov(X,Y) / (std(X) * std(Y))
+    mean_vol = mx.mean(vol_mx).item()
+    mean_perf = mx.mean(perf_mx).item()
+    
+    # Calculate covariance
+    cov = mx.mean((vol_mx - mean_vol) * (perf_mx - mean_perf)).item()
+    
+    # Calculate standard deviations
+    std_vol = mx.std(vol_mx).item()
+    std_perf = mx.std(perf_mx).item()
+    
+    # Calculate correlation
+    if std_vol > 0 and std_perf > 0:
+        correlation = cov / (std_vol * std_perf)
+    else:
+        correlation = 0
+    
+    # Calculate lag correlation (performance vs volatility with time lag)
+    # For simplicity, we'll check lags of 1-5 time steps
     lag_correlations = []
-    max_lag = min(10, len(volatility_history) // 5)  # Up to 10 lags or 1/5 of data length
     
-    for lag in range(1, max_lag + 1):
-        # Correlation between volatility and performance with a lag
-        lagged_corr, lagged_p = stats.pearsonr(
-            volatility_history[:-lag], 
-            performance_history[lag:]
-        )
-        lag_correlations.append({
-            "lag": lag,
-            "correlation": float(lagged_corr),
-            "p_value": float(lagged_p)
-        })
-    
-    # Find optimal lag (strongest negative correlation)
-    optimal_lag = min(lag_correlations, key=lambda x: x["correlation"])
-    
-    # Analyze stability during volatility changes
-    stability_in_volatility = []
-    
-    for i in range(1, len(volatility_history)):
-        volatility_change = abs(volatility_history[i] - volatility_history[i-1])
-        if volatility_change > 0.1:  # Significant volatility change
-            # Get performance before and after change
-            before_idx = max(0, i-5)
-            after_idx = min(len(performance_history)-1, i+5)
+    for lag in range(1, 6):
+        if lag < len(volatility_history):
+            # Align volatility with lagged performance
+            lagged_vol = vol_mx[:-lag]
+            lagged_perf = perf_mx[lag:]
             
-            before_perf = performance_history[before_idx:i]
-            after_perf = performance_history[i:after_idx+1]
-            
-            if before_perf and after_perf:
-                before_std = np.std(before_perf)
-                after_std = np.std(after_perf)
-                before_mean = np.mean(before_perf)
-                after_mean = np.mean(after_perf)
+            if len(lagged_vol) > 1:
+                # Calculate correlation with lag
+                mean_lagged_vol = mx.mean(lagged_vol).item()
+                mean_lagged_perf = mx.mean(lagged_perf).item()
                 
-                stability_in_volatility.append({
-                    "time_step": i,
-                    "volatility_change": float(volatility_change),
-                    "before_std": float(before_std),
-                    "after_std": float(after_std),
-                    "performance_change": float(after_mean - before_mean)
-                })
+                cov_lag = mx.mean((lagged_vol - mean_lagged_vol) * 
+                                  (lagged_perf - mean_lagged_perf)).item()
+                
+                std_lagged_vol = mx.std(lagged_vol).item()
+                std_lagged_perf = mx.std(lagged_perf).item()
+                
+                if std_lagged_vol > 0 and std_lagged_perf > 0:
+                    lag_corr = cov_lag / (std_lagged_vol * std_lagged_perf)
+                else:
+                    lag_corr = 0
+                
+                lag_correlations.append({"lag": lag, "correlation": float(lag_corr)})
+    
+    # Analyze effect of volatility changes
+    # Find periods of significant volatility increase/decrease
+    volatility_changes = []
+    for i in range(1, len(volatility_history)):
+        change = volatility_history[i] - volatility_history[i-1]
+        if abs(change) > 0.1:  # Threshold for significant change
+            volatility_changes.append({"index": i, "change": change})
+    
+    # Analyze performance before and after volatility changes
+    change_analyses = []
+    window_size = 3  # Look at performance 3 steps before and after
+    
+    for change in volatility_changes:
+        idx = change["index"]
+        
+        # Get performance before and after
+        before_start = max(0, idx - window_size)
+        after_end = min(len(performance_history), idx + window_size + 1)
+        
+        before_perf = mx.array(performance_history[before_start:idx])
+        after_perf = mx.array(performance_history[idx:after_end])
+        
+        if len(before_perf) > 0 and len(after_perf) > 0:
+            # Calculate statistics
+            before_std = mx.std(before_perf).item()
+            after_std = mx.std(after_perf).item()
+            before_mean = mx.mean(before_perf).item()
+            after_mean = mx.mean(after_perf).item()
+            
+            # Calculate performance change
+            perf_change = after_mean - before_mean
+            variance_change = after_std - before_std
+            
+            change_analyses.append({
+                "index": idx,
+                "volatility_change": change["change"],
+                "performance_before": float(before_mean),
+                "performance_after": float(after_mean),
+                "performance_change": float(perf_change),
+                "variance_before": float(before_std),
+                "variance_after": float(after_std),
+                "variance_change": float(variance_change)
+            })
     
     return {
-        "correlation": {
-            "pearson_r": float(correlation),
-            "p_value": float(p_value),
-            "significant_correlation": p_value < 0.05
-        },
-        "lag_analysis": {
-            "lag_correlations": lag_correlations,
-            "optimal_lag": optimal_lag
-        },
-        "stability_analysis": {
-            "volatility_change_points": len(stability_in_volatility),
-            "stability_details": stability_in_volatility
-        }
+        "volatility_performance_correlation": float(correlation),
+        "lag_correlations": lag_correlations,
+        "volatility_change_analyses": change_analyses
     }
 
 
@@ -318,43 +475,36 @@ def load_results(
     pattern: str = "stats_*.json"
 ) -> Dict[str, Any]:
     """
-    Load experiment results from files
+    Load experimental results from JSON files
     
     Args:
-        results_dir: Directory containing result files
+        results_dir: Directory containing results
         pattern: Glob pattern for result files
         
     Returns:
-        Dictionary with loaded results
+        Dictionary of results
     """
     results = {}
     
-    results_path = Path(results_dir)
-    if not results_path.exists():
-        logger.error(f"Results directory not found: {results_dir}")
-        return results
-    
-    # Find all matching files
-    result_files = list(results_path.glob(pattern))
-    if not result_files:
-        logger.warning(f"No result files found matching pattern {pattern} in {results_dir}")
-        return results
-    
-    # Load each file
-    for file_path in result_files:
-        try:
-            with open(file_path, 'r') as f:
-                result_data = json.load(f)
+    try:
+        # Find all matching files
+        result_files = list(Path(results_dir).glob(pattern))
+        
+        for file_path in result_files:
+            try:
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                    
+                # Use the filename without extension as the key
+                key = file_path.stem
+                results[key] = data
                 
-            # Use the filename as the key (without extension)
-            key = file_path.stem
-            results[key] = result_data
-            logger.debug(f"Loaded results from {file_path}")
-            
-        except Exception as e:
-            logger.error(f"Failed to load results from {file_path}: {e}")
+            except Exception as e:
+                logger.warning(f"Error loading {file_path}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error reading results directory: {e}")
     
-    logger.info(f"Loaded {len(results)} result files from {results_dir}")
     return results
 
 
@@ -366,33 +516,39 @@ def export_analysis_to_csv(
     Export analysis results to CSV format
     
     Args:
-        analysis_results: Dictionary with analysis results
-        output_file: Path to output CSV file
+        analysis_results: Dictionary of analysis results
+        output_file: Output CSV file path
     """
-    # Flatten nested dictionaries for CSV export
-    flattened_data = {}
-    
+    try:
+        # Flatten nested dictionary
+        flat_data = flatten_dict(analysis_results)
+        
+        # Write to CSV file
+        with open(output_file, 'w') as f:
+            # Write header
+            f.write(','.join(flat_data.keys()) + '\n')
+            
+            # Write values
+            f.write(','.join(str(v) for v in flat_data.values()) + '\n')
+            
+        logger.info(f"Exported analysis results to {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Error exporting analysis results: {e}")
+        
     def flatten_dict(d, prefix=""):
+        """Flatten nested dictionary structure"""
+        result = {}
+        
         for key, value in d.items():
             new_key = f"{prefix}_{key}" if prefix else key
+            
             if isinstance(value, dict):
-                flatten_dict(value, new_key)
+                result.update(flatten_dict(value, new_key))
             else:
-                flattened_data[new_key] = value
-    
-    flatten_dict(analysis_results)
-    
-    # Convert to DataFrame and export
-    df = pd.DataFrame([flattened_data])
-    
-    try:
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-        
-        df.to_csv(output_file, index=False)
-        logger.info(f"Exported analysis results to {output_file}")
-    except Exception as e:
-        logger.error(f"Failed to export analysis results: {e}")
+                result[new_key] = value
+                
+        return result
 
 
 def perform_comprehensive_analysis(
@@ -400,67 +556,62 @@ def perform_comprehensive_analysis(
     output_dir: str
 ) -> Dict[str, Any]:
     """
-    Perform comprehensive analysis of experiment results
+    Perform comprehensive analysis on experiment results
     
     Args:
         results_dir: Directory containing experiment results
         output_dir: Directory to save analysis outputs
         
     Returns:
-        Dictionary with comprehensive analysis results
+        Dictionary of analysis results
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load experiment results
+    # Load results
     results = load_results(results_dir)
-    if not results:
-        logger.error("No results to analyze")
-        return {"error": "No results to analyze"}
     
-    # Use the most recent result for analysis
-    latest_result_key = sorted(results.keys())[-1]
-    result_data = results[latest_result_key]
+    analysis_results = {}
     
-    # Extract data for analysis
-    fitness_history = result_data.get("fitness_history", [])
-    lci_history = result_data.get("lci_history", [])
-    best_agent_history = result_data.get("best_agent_history", [])
+    for exp_name, exp_data in results.items():
+        # Extract data for analysis
+        exp_analysis = {}
+        
+        # Analyze fitness progression if available
+        if "fitness_history" in exp_data:
+            exp_analysis["fitness_progression"] = analyze_fitness_progression(
+                exp_data["fitness_history"]
+            )
+        
+        # Analyze LCI evolution if available
+        if "lci_history" in exp_data:
+            exp_analysis["lci_evolution"] = analyze_lci_evolution(
+                exp_data["lci_history"]
+            )
+        
+        # Analyze environmental response if available
+        if "volatility_history" in exp_data and "performance_history" in exp_data:
+            exp_analysis["environmental_response"] = analyze_environmental_response(
+                exp_data["volatility_history"],
+                exp_data["performance_history"]
+            )
+        
+        # Store analysis results
+        analysis_results[exp_name] = exp_analysis
+        
+        # Export to JSON
+        output_file = os.path.join(output_dir, f"{exp_name}_analysis.json")
+        try:
+            with open(output_file, 'w') as f:
+                json.dump(exp_analysis, f, indent=2)
+            logger.info(f"Saved analysis for {exp_name} to {output_file}")
+        except Exception as e:
+            logger.error(f"Error saving analysis results: {e}")
     
-    # Perform analyses
-    fitness_analysis = analyze_fitness_progression(fitness_history)
-    lci_evolution_analysis = analyze_lci_evolution(lci_history)
-    
-    # Get LCI balance values from the best agents over time
-    if best_agent_history:
-        balance_values = [agent.get("lci_balance", 0) for agent in best_agent_history if "lci_balance" in agent]
-        balance_analysis = analyze_lci_balance(balance_values)
-    else:
-        balance_analysis = {"error": "No balance data available"}
-    
-    # Comprehensive analysis results
-    analysis_results = {
-        "fitness_analysis": fitness_analysis,
-        "lci_evolution_analysis": lci_evolution_analysis,
-        "balance_analysis": balance_analysis,
-        "metadata": {
-            "source_result": latest_result_key,
-            "analysis_date": pd.Timestamp.now().isoformat()
-        }
-    }
-    
-    # Export analysis to CSV
+    # Export summary to CSV
     export_analysis_to_csv(
         analysis_results,
-        os.path.join(output_dir, "comprehensive_analysis.csv")
+        os.path.join(output_dir, "analysis_summary.csv")
     )
-    
-    # Save detailed analysis results as JSON
-    try:
-        with open(os.path.join(output_dir, "comprehensive_analysis.json"), 'w') as f:
-            json.dump(analysis_results, f, indent=2, default=str)
-        logger.info("Saved comprehensive analysis results to JSON")
-    except Exception as e:
-        logger.error(f"Failed to save analysis results to JSON: {e}")
     
     return analysis_results 

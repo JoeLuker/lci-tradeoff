@@ -10,7 +10,6 @@ import os
 import yaml
 import argparse
 import logging
-import torch
 import time
 import pandas as pd
 import matplotlib.pyplot as plt

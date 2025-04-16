@@ -9,11 +9,9 @@ import os
 import yaml
 import argparse
 import logging
-import torch
 import time
 import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
 from datetime import datetime
 from lci_framework.core.evolution import TensorEvolution
 

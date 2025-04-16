@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Main entry point for running the LCI framework with tensor-based implementation.
-This implementation utilizes GPU acceleration for faster simulations.
+Main entry point for running the LCI framework with MLX-based implementation.
+This implementation utilizes Apple Silicon acceleration for faster simulations.
 """
 
 import os
 import argparse
 import yaml
 import logging
-import torch
 from datetime import datetime
 from lci_framework.core.evolution import TensorEvolution
 
@@ -31,16 +30,8 @@ def load_config(config_path):
 
 def run_simulation(config):
     """Run a tensor-based LCI simulation with the given configuration."""
-    # Check if GPU is available
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using MPS for GPU acceleration")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Using CUDA for GPU acceleration")
-    else:
-        device = torch.device("cpu")
-        print("Warning: No GPU available. Using CPU, which will be slower")
+    # MLX automatically uses the most efficient device available on Apple Silicon
+    print("Using MLX with unified memory architecture for acceleration")
     
     # Create output directory
     output_dir = config.get('output_dir', 'results/lci_run')
@@ -63,8 +54,7 @@ def run_simulation(config):
         energy_cost_predict=config.get('energy_cost_predict', 0.01),
         energy_cost_learn=config.get('energy_cost_learn', 0.05),
         energy_recovery=config.get('energy_recovery', 0.1),
-        output_dir=output_dir,
-        device=device
+        output_dir=output_dir
     )
     
     # Run the simulation
