@@ -434,8 +434,8 @@ class TensorEvolution:
             try:
                 # FIX: Use ones_like and zeros_like instead of scalar values to ensure proper broadcasting
                 actions = mx.where(bool_actions, 
-                                  mx.ones_like(bool_actions, dtype=mx.int32), 
-                                  mx.zeros_like(bool_actions, dtype=mx.int32))
+                                  mx.ones_like(bool_actions).astype(mx.int32), 
+                                  mx.zeros_like(bool_actions).astype(mx.int32))
                 logger.debug(f"actions type: {type(actions)}, shape: {getattr(actions, 'shape', None)}")
             except Exception as e:
                 logger.error(f"Error creating actions array: {str(e)}")

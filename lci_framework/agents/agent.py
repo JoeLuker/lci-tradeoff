@@ -169,7 +169,7 @@ class NeuralPopulation(nn.Module):
             x = nn.relu(layer(x))
             # Apply dropout if in training mode
             if self.dropout_rate > 0:
-                mask = mx.random.uniform(x.shape) > self.dropout_rate
+                mask = mx.random.uniform(shape=x.shape) > self.dropout_rate
                 x = x * mask * (1.0 / (1.0 - self.dropout_rate))
         
         # Forward pass through output layer
@@ -401,7 +401,7 @@ class TensorLCIAgent:
                 
             # Randomly determine which agents will learn this time
             # FIX: Safe broadcasting for learn_mask creation
-            random_values = mx.random.uniform((self.pop_size,))
+            random_values = mx.random.uniform(shape=(self.pop_size,))
             learn_threshold = mx.ones(random_values.shape) * self.learn_prob
             learn_prob_check = random_values < learn_threshold
             learn_mask = mx.logical_and(learn_prob_check, alive_mask)
