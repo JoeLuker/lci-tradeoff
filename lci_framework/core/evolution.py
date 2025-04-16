@@ -711,7 +711,38 @@ class TensorEvolution:
         # Get alive count directly from agent energy levels
         # Only count agents with enough energy to learn as "alive"
         energy_levels = self.agents.get_energy()
-        alive_count = mx.sum(energy_levels >= self.agents.energy_cost_learn).item()
+        
+        # Safely determine energy threshold regardless of structure (array or scalar)
+        if isinstance(self.agents.energy_cost_learn, mx.array):
+            # For array case, create a comparable threshold
+            if self.agents.energy_cost_learn.ndim > 1:
+                # Check for incorrectly expanded array
+                if self.agents.energy_cost_learn.size == self.pop_size * self.pop_size:
+                    # It's expanded incorrectly, use the baseline value instead
+                    if hasattr(self.agents, 'base_energy_cost_learn'):
+                        threshold = self.agents.base_energy_cost_learn
+                    else:
+                        # Fallback to mean value
+                        threshold = self.agents.energy_cost_learn.mean().item()
+                else:
+                    # Take first column of 2D array
+                    threshold = self.agents.energy_cost_learn[:, 0]
+            else:
+                # It's already 1D array
+                threshold = self.agents.energy_cost_learn
+        else:
+            # Scalar case - use directly
+            threshold = self.agents.energy_cost_learn
+        
+        # Calculate alive count with proper broadcasting
+        if isinstance(threshold, mx.array):
+            # Array threshold case
+            alive_mask = energy_levels >= threshold
+        else:
+            # Scalar threshold case
+            alive_mask = energy_levels >= threshold
+            
+        alive_count = mx.sum(alive_mask).item()
         
         return Stats(
             generation=self.generation,
@@ -984,6 +1015,12 @@ class TensorEvolution:
         # Store the current steps_per_generation
         original_steps = self.steps_per_generation
         self.steps_per_generation = steps
+        
+        # Check and fix energy parameters if needed
+        if hasattr(self.agents, 'check_and_fix_energy_shapes'):
+            fixed_count = self.agents.check_and_fix_energy_shapes()
+            if fixed_count > 0:
+                logger.info(f"Fixed {fixed_count} corrupted energy parameter shapes before generation {self.generation}")
         
         # Evaluate fitness
         fitness, lci_values = self.evaluate_fitness()

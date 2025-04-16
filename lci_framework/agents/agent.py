@@ -314,9 +314,17 @@ class TensorLCIAgent:
         
         # Initialize energy parameters
         if evolvable_energy:
-            self.energy_cost_predict = mx.ones((pop_size, 1)) * energy_cost_predict
-            self.energy_cost_learn = mx.ones((pop_size, 1)) * energy_cost_learn
-            self.energy_recovery = mx.ones((pop_size, 1)) * energy_recovery
+            # Change from 2D to 1D tensors to avoid broadcasting issues
+            self.energy_cost_predict = mx.ones((pop_size,)) * energy_cost_predict
+            self.energy_cost_learn = mx.ones((pop_size,)) * energy_cost_learn
+            self.energy_recovery = mx.ones((pop_size,)) * energy_recovery
+            
+            # Add the expected parameters for evolution
+            self.base_energy_cost_predict = energy_cost_predict
+            self.base_energy_cost_learn = energy_cost_learn
+            self.energy_efficiency = mx.ones((pop_size,))
+            self.learn_probability = mx.ones((pop_size,)) * learn_prob
+            self.recovery_rate = mx.ones((pop_size,)) * energy_recovery
         else:
             self.energy_cost_predict = energy_cost_predict
             self.energy_cost_learn = energy_cost_learn
@@ -366,7 +374,21 @@ class TensorLCIAgent:
         # Reduce energy for prediction (for all alive agents)
         if isinstance(self.energy_cost_predict, mx.array):
             # Batch energy cost reduction for evolved parameters
-            energy_cost = mx.squeeze(self.energy_cost_predict, axis=1)
+            if self.energy_cost_predict.ndim > 1:
+                # Check for incorrectly expanded array
+                if self.energy_cost_predict.size == self.pop_size * self.pop_size:
+                    # It's expanded incorrectly, fix it by resetting to original value
+                    logger.warning(f"Fixing incorrectly shaped energy_cost_predict (size {self.energy_cost_predict.size})")
+                    # Reset to baseline value with correct shape
+                    energy_cost = mx.ones((self.pop_size,)) * self.base_energy_cost_predict
+                    # Also fix the stored value for future use
+                    self.energy_cost_predict = energy_cost
+                else:
+                    # It's a 2D array with correct size, take the first column
+                    energy_cost = self.energy_cost_predict[:, 0]
+            else:
+                # It's already 1D
+                energy_cost = self.energy_cost_predict
             # Only reduce energy for alive agents
             energy_reduction = energy_cost * alive_mask
             self.energy = mx.maximum(0, self.energy - energy_reduction)
@@ -413,13 +435,28 @@ class TensorLCIAgent:
             # Check if agents have enough energy to learn
             if isinstance(self.energy_cost_learn, mx.array):
                 # Batch energy check for evolved parameters
-                energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
-                # FIX: Safe comparison for can_learn_mask
+                if self.energy_cost_learn.ndim > 1:
+                    # Check for incorrectly expanded array
+                    if self.energy_cost_learn.size == self.pop_size * self.pop_size:
+                        # It's expanded incorrectly, fix it by resetting to original value
+                        logger.warning(f"Fixing incorrectly shaped energy_cost_learn (size {self.energy_cost_learn.size})")
+                        # Reset to baseline value with correct shape
+                        energy_cost = mx.ones((self.pop_size,)) * self.base_energy_cost_learn
+                        # Also fix the stored value for future use
+                        self.energy_cost_learn = energy_cost
+                    else:
+                        # It's a 2D array with correct size, take the first column
+                        energy_cost = self.energy_cost_learn[:, 0]
+                else:
+                    # It's already 1D
+                    energy_cost = self.energy_cost_learn
+                
+                # Safe comparison for can_learn_mask
                 energy_check = self.energy >= energy_cost
                 can_learn_mask = mx.logical_and(energy_check, learn_mask)
             else:
                 # Scalar energy check
-                # FIX: Safe scalar comparison
+                # Safe scalar comparison
                 energy_threshold = mx.ones(self.energy.shape) * self.energy_cost_learn
                 energy_check = self.energy >= energy_threshold
                 can_learn_mask = mx.logical_and(energy_check, learn_mask)
@@ -431,7 +468,10 @@ class TensorLCIAgent:
             # Reduce energy for learning agents
             if isinstance(self.energy_cost_learn, mx.array):
                 # Batch energy reduction for evolved parameters
-                energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
+                if self.energy_cost_learn.ndim > 1:
+                    energy_cost = mx.reshape(self.energy_cost_learn, (self.pop_size,))
+                else:
+                    energy_cost = self.energy_cost_learn
                 # FIX: Safe multiplication
                 energy_reduction = mx.multiply(energy_cost, can_learn_mask.astype(mx.float32))
                 self.energy = mx.maximum(mx.zeros(self.energy.shape), self.energy - energy_reduction)
@@ -543,7 +583,22 @@ class TensorLCIAgent:
         # Apply energy recovery for alive agents
         if isinstance(self.energy_recovery, mx.array):
             # Batch energy recovery for evolved parameters
-            recovery_rate = mx.squeeze(self.energy_recovery, axis=1)
+            if self.energy_recovery.ndim > 1:
+                # Check for incorrectly expanded array
+                if self.energy_recovery.size == self.pop_size * self.pop_size:
+                    # It's expanded incorrectly, fix it by resetting to original value
+                    logger.warning(f"Fixing incorrectly shaped energy_recovery (size {self.energy_recovery.size})")
+                    # Reset to baseline with correct shape (assuming recovery_rate is already set)
+                    recovery_rate = self.recovery_rate
+                    # Also fix the stored value for future use
+                    self.energy_recovery = recovery_rate
+                else:
+                    # It's a 2D array with correct size, take the first column
+                    recovery_rate = self.energy_recovery[:, 0]
+            else:
+                # It's already 1D
+                recovery_rate = self.energy_recovery
+            
             energy_recovery = recovery_rate * self.alive_mask
         else:
             # Scalar energy recovery
@@ -728,3 +783,36 @@ class TensorLCIAgent:
             except:
                 # If files don't exist, keep the current values
                 pass
+    
+    def check_and_fix_energy_shapes(self) -> None:
+        """
+        Check energy parameter shapes and correct them if they've expanded incorrectly.
+        This can happen due to broadcasting issues during evolution.
+        """
+        fixed_count = 0
+        
+        # Check and fix energy_cost_predict
+        if isinstance(self.energy_cost_predict, mx.array) and self.energy_cost_predict.ndim > 1:
+            if self.energy_cost_predict.size == self.pop_size * self.pop_size:
+                logger.warning(f"Fixing corrupted energy_cost_predict shape: {self.energy_cost_predict.shape}")
+                self.energy_cost_predict = mx.ones((self.pop_size,)) * self.base_energy_cost_predict
+                fixed_count += 1
+        
+        # Check and fix energy_cost_learn
+        if isinstance(self.energy_cost_learn, mx.array) and self.energy_cost_learn.ndim > 1:
+            if self.energy_cost_learn.size == self.pop_size * self.pop_size:
+                logger.warning(f"Fixing corrupted energy_cost_learn shape: {self.energy_cost_learn.shape}")
+                self.energy_cost_learn = mx.ones((self.pop_size,)) * self.base_energy_cost_learn
+                fixed_count += 1
+        
+        # Check and fix energy_recovery
+        if isinstance(self.energy_recovery, mx.array) and self.energy_recovery.ndim > 1:
+            if self.energy_recovery.size == self.pop_size * self.pop_size:
+                logger.warning(f"Fixing corrupted energy_recovery shape: {self.energy_recovery.shape}")
+                self.energy_recovery = self.recovery_rate.copy() if hasattr(self, 'recovery_rate') else mx.ones((self.pop_size,)) * 0.05
+                fixed_count += 1
+        
+        if fixed_count > 0:
+            logger.info(f"Fixed {fixed_count} corrupted energy parameter shapes")
+        
+        return fixed_count

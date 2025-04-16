@@ -13,9 +13,9 @@ n_layers: 2 # Number of hidden layers
 dropout_rate: 0.1 # Dropout rate for regularization
 
 # Energy parameters
-energy_init: 10.0 # Initial energy level
-energy_cost_predict: 0.01 # Energy cost for prediction
-energy_cost_learn: 0.05 # Energy cost for learning
+energy_init: 5.0 # Initial energy level
+energy_cost_predict: 0.02 # Energy cost for prediction
+energy_cost_learn: 0.2 # Energy cost for learning
 energy_recovery: 0.02 # Energy recovery per step
 learn_prob: 0.1 # Probability of learning each step
 evolvable_energy: true # Whether to use evolvable energy parameters
@@ -27,7 +27,7 @@ elitism: 0.1 # Fraction of population preserved via elitism
 
 # Training parameters
 n_generations: 20 # Number of generations to run
-steps_per_generation: 100 # Environment steps per generation
+steps_per_generation: 1000 # Environment steps per generation
 learning_rate: 0.001 # Learning rate for neural network updates
 
 # Output parameters
