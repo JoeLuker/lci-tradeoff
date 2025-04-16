@@ -21,11 +21,13 @@ This is a tensor-based implementation of the LCI (Learning, Cognition, Intellige
 ### Quick Start
 
 1. Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
 2. Run a simulation:
+
 ```bash
 python run.py
 ```
@@ -35,6 +37,7 @@ python run.py
 The implementation uses YAML configuration files. A sample is provided in `config/lci_config.yaml`.
 
 Key parameters:
+
 - `pop_size`: Population size for evolutionary algorithm
 - `n_states`: Number of states in the environment
 - `n_actions`: Number of possible actions
@@ -51,6 +54,7 @@ python run.py --config config/lci_config.yaml --output results/my_run --log-leve
 ```
 
 Options:
+
 - `--config`: Path to configuration file
 - `--output`: Output directory (overrides config setting)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)

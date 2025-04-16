@@ -394,115 +394,143 @@ class TensorLCIAgent:
         Returns:
             None
         """
-        # Use the internal alive mask if not provided
-        if alive_mask is None:
-            alive_mask = self.alive_mask
+        try:
+            # Use the internal alive mask if not provided
+            if alive_mask is None:
+                alive_mask = self.alive_mask
+                
+            # Randomly determine which agents will learn this time
+            # FIX: Safe broadcasting for learn_mask creation
+            random_values = mx.random.uniform((self.pop_size,))
+            learn_threshold = mx.full_like(random_values, self.learn_prob)
+            learn_prob_check = random_values < learn_threshold
+            learn_mask = mx.logical_and(learn_prob_check, alive_mask)
             
-        # Randomly determine which agents will learn this time
-        learn_mask = (mx.random.uniform((self.pop_size,)) < self.learn_prob) & alive_mask
-        
-        # Only continue if there are agents that want to learn
-        if not mx.any(learn_mask):
-            return
+            # Only continue if there are agents that want to learn
+            if mx.sum(learn_mask) == 0:
+                return
+                
+            # Check if agents have enough energy to learn
+            if isinstance(self.energy_cost_learn, mx.array):
+                # Batch energy check for evolved parameters
+                energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
+                # FIX: Safe comparison for can_learn_mask
+                energy_check = self.energy >= energy_cost
+                can_learn_mask = mx.logical_and(energy_check, learn_mask)
+            else:
+                # Scalar energy check
+                # FIX: Safe scalar comparison
+                energy_threshold = mx.full_like(self.energy, self.energy_cost_learn)
+                energy_check = self.energy >= energy_threshold
+                can_learn_mask = mx.logical_and(energy_check, learn_mask)
+                
+            # Only continue if there are agents that can learn
+            if mx.sum(can_learn_mask) == 0:
+                return
+                
+            # Reduce energy for learning agents
+            if isinstance(self.energy_cost_learn, mx.array):
+                # Batch energy reduction for evolved parameters
+                energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
+                # FIX: Safe multiplication
+                energy_reduction = mx.multiply(energy_cost, can_learn_mask.astype(mx.float32))
+                self.energy = mx.maximum(mx.zeros_like(self.energy), self.energy - energy_reduction)
+            else:
+                # Scalar energy reduction
+                # FIX: Safe scalar reduction
+                cost_amount = mx.full_like(self.energy, self.energy_cost_learn)
+                energy_reduction = mx.multiply(cost_amount, can_learn_mask.astype(mx.float32))
+                self.energy = mx.maximum(mx.zeros_like(self.energy), self.energy - energy_reduction)
+                
+            # Update learn decision counter
+            # FIX: Safe integer conversion
+            learn_increments = can_learn_mask.astype(mx.int32)
+            self.learn_decisions = self.learn_decisions + learn_increments
             
-        # Check if agents have enough energy to learn
-        if isinstance(self.energy_cost_learn, mx.array):
-            # Batch energy check for evolved parameters
-            energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
-            can_learn_mask = (self.energy >= energy_cost) & learn_mask
-        else:
-            # Scalar energy check
-            can_learn_mask = (self.energy >= self.energy_cost_learn) & learn_mask
+            # Define loss function using MLX's functional approach
+            def loss_fn(params):
+                # Extract parameters for policy network
+                policy_params = {}
+                idx = 0
+                for i, layer in enumerate(self.policy_net.layers):
+                    if hasattr(layer, 'weight'):
+                        policy_params[f'layer_{i}_weight'] = params[idx]
+                        idx += 1
+                    if hasattr(layer, 'bias'):
+                        policy_params[f'layer_{i}_bias'] = params[idx]
+                        idx += 1
+                        
+                # Extract output layer parameters
+                policy_params['output_weight'] = params[idx]
+                idx += 1
+                if hasattr(self.policy_net.output_layer, 'bias'):
+                    policy_params['output_bias'] = params[idx]
+                
+                # Forward pass with these parameters
+                # This is simplified and would need to be implemented properly
+                # based on how your forward pass works with specific parameters
+                pred = self.policy_net(observation)
+                
+                # Compute MSE loss only for learning agents
+                squared_errors = mx.square(pred - reward.reshape(-1, 1))
+                # FIX: Ensure safe operations for loss calculation
+                mask_reshaped = mx.reshape(can_learn_mask, (-1, 1)).astype(mx.float32)
+                masked_errors = mx.multiply(squared_errors, mask_reshaped)
+                # Avoid division by zero
+                divisor = mx.maximum(mx.sum(can_learn_mask), 1)
+                mse_loss = mx.sum(masked_errors) / divisor
+                
+                # Add regularization
+                l1_loss = self.policy_net.l1_loss() * self.l1_reg
+                l2_loss = self.policy_net.l2_loss() * self.l2_reg
+                
+                return mse_loss + l1_loss + l2_loss
             
-        # Only continue if there are agents that can learn
-        if not mx.any(can_learn_mask):
-            return
-            
-        # Reduce energy for learning agents
-        if isinstance(self.energy_cost_learn, mx.array):
-            # Batch energy reduction for evolved parameters
-            energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
-            energy_reduction = energy_cost * can_learn_mask
-            self.energy = mx.maximum(0, self.energy - energy_reduction)
-        else:
-            # Scalar energy reduction
-            self.energy = mx.maximum(0, self.energy - (self.energy_cost_learn * can_learn_mask))
-            
-        # Update learn decision counter
-        self.learn_decisions = self.learn_decisions + mx.array(can_learn_mask, dtype=mx.int32)
-        
-        # Define loss function using MLX's functional approach
-        def loss_fn(params):
-            # Extract parameters for policy network
-            policy_params = {}
-            idx = 0
-            for i, layer in enumerate(self.policy_net.layers):
+            # Get model parameters as a list
+            params = []
+            for layer in self.policy_net.layers:
                 if hasattr(layer, 'weight'):
-                    policy_params[f'layer_{i}_weight'] = params[idx]
+                    params.append(layer.weight)
+                if hasattr(layer, 'bias'):
+                    params.append(layer.bias)
+                    
+            # Add output layer parameters
+            params.append(self.policy_net.output_layer.weight)
+            if hasattr(self.policy_net.output_layer, 'bias'):
+                params.append(self.policy_net.output_layer.bias)
+                
+            # Compute gradients
+            grads = mx.grad(loss_fn)(params)
+            
+            # Update parameters with gradients
+            for i, (param, grad) in enumerate(zip(params, grads)):
+                params[i] = param - self.learning_rate * grad
+                
+            # Update model parameters
+            idx = 0
+            for layer in self.policy_net.layers:
+                if hasattr(layer, 'weight'):
+                    layer.weight = params[idx]
                     idx += 1
                 if hasattr(layer, 'bias'):
-                    policy_params[f'layer_{i}_bias'] = params[idx]
+                    layer.bias = params[idx]
                     idx += 1
                     
-            # Extract output layer parameters
-            policy_params['output_weight'] = params[idx]
+            # Update output layer parameters
+            self.policy_net.output_layer.weight = params[idx]
             idx += 1
             if hasattr(self.policy_net.output_layer, 'bias'):
-                policy_params['output_bias'] = params[idx]
-            
-            # Forward pass with these parameters
-            # This is simplified and would need to be implemented properly
-            # based on how your forward pass works with specific parameters
-            pred = self.policy_net(observation)
-            
-            # Compute MSE loss only for learning agents
-            squared_errors = mx.square(pred - reward.reshape(-1, 1))
-            mse_loss = mx.sum(squared_errors * can_learn_mask.reshape(-1, 1)) / mx.sum(can_learn_mask)
-            
-            # Add regularization
-            l1_loss = self.policy_net.l1_loss() * self.l1_reg
-            l2_loss = self.policy_net.l2_loss() * self.l2_reg
-            
-            return mse_loss + l1_loss + l2_loss
-        
-        # Get model parameters as a list
-        params = []
-        for layer in self.policy_net.layers:
-            if hasattr(layer, 'weight'):
-                params.append(layer.weight)
-            if hasattr(layer, 'bias'):
-                params.append(layer.bias)
+                self.policy_net.output_layer.bias = params[idx]
                 
-        # Add output layer parameters
-        params.append(self.policy_net.output_layer.weight)
-        if hasattr(self.policy_net.output_layer, 'bias'):
-            params.append(self.policy_net.output_layer.bias)
+            # Increment training step counter
+            self.train_step += 1
             
-        # Compute gradients
-        grads = mx.grad(loss_fn)(params)
-        
-        # Update parameters with gradients
-        for i, (param, grad) in enumerate(zip(params, grads)):
-            params[i] = param - self.learning_rate * grad
-            
-        # Update model parameters
-        idx = 0
-        for layer in self.policy_net.layers:
-            if hasattr(layer, 'weight'):
-                layer.weight = params[idx]
-                idx += 1
-            if hasattr(layer, 'bias'):
-                layer.bias = params[idx]
-                idx += 1
-                
-        # Update output layer parameters
-        self.policy_net.output_layer.weight = params[idx]
-        idx += 1
-        if hasattr(self.policy_net.output_layer, 'bias'):
-            self.policy_net.output_layer.bias = params[idx]
-            
-        # Increment training step counter
-        self.train_step += 1
+        except Exception as e:
+            # Provide more detailed error information
+            import traceback
+            print(f"Error in learn method: {e}")
+            traceback.print_exc()
+            # Don't re-raise - let simulation continue despite learning failures
     
     def update_energy(self, performance_factor=None) -> None:
         """
