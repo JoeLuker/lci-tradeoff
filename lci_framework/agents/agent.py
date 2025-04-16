@@ -402,7 +402,7 @@ class TensorLCIAgent:
             # Randomly determine which agents will learn this time
             # FIX: Safe broadcasting for learn_mask creation
             random_values = mx.random.uniform((self.pop_size,))
-            learn_threshold = mx.full_like(random_values, self.learn_prob)
+            learn_threshold = mx.ones(random_values.shape) * self.learn_prob
             learn_prob_check = random_values < learn_threshold
             learn_mask = mx.logical_and(learn_prob_check, alive_mask)
             
@@ -420,7 +420,7 @@ class TensorLCIAgent:
             else:
                 # Scalar energy check
                 # FIX: Safe scalar comparison
-                energy_threshold = mx.full_like(self.energy, self.energy_cost_learn)
+                energy_threshold = mx.ones(self.energy.shape) * self.energy_cost_learn
                 energy_check = self.energy >= energy_threshold
                 can_learn_mask = mx.logical_and(energy_check, learn_mask)
                 
@@ -434,13 +434,13 @@ class TensorLCIAgent:
                 energy_cost = mx.squeeze(self.energy_cost_learn, axis=1)
                 # FIX: Safe multiplication
                 energy_reduction = mx.multiply(energy_cost, can_learn_mask.astype(mx.float32))
-                self.energy = mx.maximum(mx.zeros_like(self.energy), self.energy - energy_reduction)
+                self.energy = mx.maximum(mx.zeros(self.energy.shape), self.energy - energy_reduction)
             else:
                 # Scalar energy reduction
                 # FIX: Safe scalar reduction
-                cost_amount = mx.full_like(self.energy, self.energy_cost_learn)
+                cost_amount = mx.ones(self.energy.shape) * self.energy_cost_learn
                 energy_reduction = mx.multiply(cost_amount, can_learn_mask.astype(mx.float32))
-                self.energy = mx.maximum(mx.zeros_like(self.energy), self.energy - energy_reduction)
+                self.energy = mx.maximum(mx.zeros(self.energy.shape), self.energy - energy_reduction)
                 
             # Update learn decision counter
             # FIX: Safe integer conversion
@@ -477,7 +477,7 @@ class TensorLCIAgent:
                 mask_reshaped = mx.reshape(can_learn_mask, (-1, 1)).astype(mx.float32)
                 masked_errors = mx.multiply(squared_errors, mask_reshaped)
                 # Avoid division by zero
-                divisor = mx.maximum(mx.sum(can_learn_mask), 1)
+                divisor = mx.maximum(mx.sum(can_learn_mask), mx.array(1))
                 mse_loss = mx.sum(masked_errors) / divisor
                 
                 # Add regularization

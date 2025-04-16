@@ -495,94 +495,133 @@ class TensorEvolution:
         Returns:
             Tuple of updated state arrays (all MLX arrays)
         """
-        # Verify array dimensions - create new arrays if needed
-        if not hasattr(rewards, 'shape') or rewards.shape[0] != self.pop_size or step_counts.shape[0] != self.pop_size:
-            logger.warning(f"Array dimension mismatch in _update_batch_state. "
-                          f"Expected pop_size={self.pop_size}, got rewards shape={getattr(rewards, 'shape', None)}, "
-                          f"step_counts shape={getattr(step_counts, 'shape', None)}")
-            # Ensure dimensions match by recreating arrays
-            rewards = mx.zeros((self.pop_size,))
-            step_counts = mx.zeros((self.pop_size,), dtype=mx.int32)
-            alive_agents = mx.ones((self.pop_size,), dtype=mx.bool_)
-            lci_values = mx.zeros((self.pop_size,))
-        
-        # Use MLX operations where possible
-        
-        # Update rewards for alive agents
-        rewards = mx.where(alive_agents, rewards + reward_batch, rewards)
-        
-        # Update step counts for alive agents
-        step_counts = mx.where(alive_agents, step_counts + 1, step_counts)
-        
-        # Get energy levels to check which agents are still alive
-        energy = self.agents.get_energy()
-        
-        # Calculate performance factors (reward relative to maximum possible)
-        performance_factor = mx.clip(reward_batch / 1.0, a_min=0.0, a_max=1.0)
-        
-        # Learn from experience using batched operations
-        if mx.sum(alive_agents) > 0:
-            # Determine which agents should learn
-            learn_prob = getattr(self.agents, 'learn_probability', 0.1)
+        try:
+            # Verify array dimensions - create new arrays if needed
+            if not hasattr(rewards, 'shape') or rewards.shape[0] != self.pop_size or step_counts.shape[0] != self.pop_size:
+                logger.warning(f"Array dimension mismatch in _update_batch_state. "
+                            f"Expected pop_size={self.pop_size}, got rewards shape={getattr(rewards, 'shape', None)}, "
+                            f"step_counts shape={getattr(step_counts, 'shape', None)}")
+                # Ensure dimensions match by recreating arrays
+                rewards = mx.zeros((self.pop_size,))
+                step_counts = mx.zeros((self.pop_size,), dtype=mx.int32)
+                alive_agents = mx.ones((self.pop_size,), dtype=mx.bool_)
+                lci_values = mx.zeros((self.pop_size,))
             
-            # Create random values for learn probability check
-            learn_rand = mx.random.uniform(shape=(self.pop_size,))
+            # Use MLX operations where possible - with explicit safe operations
             
-            # Determine learn mask based on probability
-            if hasattr(learn_prob, 'shape'):
-                # Use each agent's individual learn probability
-                learn_mask = alive_agents & (learn_rand < learn_prob)
+            # Update rewards for alive agents - FIX: use safe broadcasting
+            alive_float = alive_agents.astype(mx.float32)
+            reward_inc = mx.multiply(reward_batch, alive_float)
+            rewards = rewards + reward_inc
+            
+            # Update step counts for alive agents - FIX: use safe integer conversion
+            alive_int = alive_agents.astype(mx.int32)
+            step_counts = step_counts + alive_int
+            
+            # Get energy levels to check which agents are still alive
+            energy = self.agents.get_energy()
+            
+            # Calculate performance factors (reward relative to maximum possible)
+            # FIX: use explicit operations to avoid tuple issues
+            max_reward = mx.ones(reward_batch.shape)  # Maximum reward is 1.0
+            reward_ratio = reward_batch / max_reward
+            zero_vals = mx.zeros(reward_batch.shape)
+            one_vals = mx.ones(reward_batch.shape)
+            performance_factor = mx.clip(reward_ratio, a_min=zero_vals, a_max=one_vals)
+            
+            # Learn from experience using batched operations
+            n_alive_agents = int(mx.sum(alive_agents).astype(mx.int32).item() or 0)
+            if n_alive_agents > 0:
+                # Determine which agents should learn
+                learn_prob = getattr(self.agents, 'learn_probability', 0.1)
+                
+                # Create random values for learn probability check
+                learn_rand = mx.random.uniform(shape=(self.pop_size,))
+                
+                # Determine learn mask based on probability - FIX: use safe comparisons
+                if hasattr(learn_prob, 'shape'):
+                    # Use each agent's individual learn probability
+                    learn_check = learn_rand < learn_prob
+                    learn_mask = mx.logical_and(alive_agents, learn_check)
+                else:
+                    # Use fixed learn probability - FIX: broadcast properly
+                    learn_threshold = mx.ones(learn_rand.shape) * learn_prob
+                    learn_check = learn_rand < learn_threshold
+                    learn_mask = mx.logical_and(alive_agents, learn_check)
+                
+                # Only attempt learning if at least one agent should learn
+                n_learning = int(mx.sum(learn_mask).astype(mx.int32).item() or 0)
+                if n_learning > 0:
+                    # Let the agent's learn method handle batching and energy checks
+                    try:
+                        # Pass alive_agents mask to learn method
+                        self.agents.learn(observations, reward_batch, alive_mask=alive_agents)
+                    except Exception as e:
+                        logger.warning(f"Learning failed: {e}. Continuing with simulation.")
+            
+            # Update agent energy recovery with performance factor (batched)
+            self.agents.update_energy(performance_factor)
+            
+            # Get updated energy after recovery
+            energy = self.agents.get_energy()
+            
+            # Update alive status based on done flag and energy - FIX: use safe logical operations
+            # Step 1: Check which agents have enough energy
+            has_energy = energy > mx.zeros(energy.shape)
+            # Step 2: Check which agents aren't done
+            not_done = mx.logical_not(done_batch)
+            # Step 3: Combine with current alive status
+            new_alive_agents = mx.logical_and(alive_agents, not_done)
+            new_alive_agents = mx.logical_and(new_alive_agents, has_energy)
+            
+            # Get number of alive agents - safely convert to integer
+            n_alive = int(mx.sum(new_alive_agents).astype(mx.int32).item() or 0)
+            
+            # Update observations for agents that are still alive
+            if hasattr(observations, 'shape') and hasattr(next_observations, 'shape'):
+                # Verify observation array dimensions
+                if observations.shape[0] != self.pop_size or next_observations.shape[0] != self.pop_size:
+                    logger.warning(f"Observation dimension mismatch. Expected pop_size={self.pop_size}, "
+                                f"got observations shape={observations.shape}, next_observations shape={next_observations.shape}")
+                    # Reset observations to default
+                    observations = self._get_default_observations()
+                else:
+                    # Create a mask for selecting observations by expanding dimensions for proper broadcasting
+                    # FIX: Use reshape instead of expand_dims for safer operation
+                    new_alive_expanded = mx.reshape(new_alive_agents, (-1, 1))
+                    # Broadcast mask to match observation dimensions - create from scratch
+                    if observations.ndim > 1:
+                        repeats = [1, observations.shape[1]]
+                        mask = mx.tile(new_alive_expanded, repeats)
+                    else:
+                        mask = new_alive_agents
+                        
+                    # FIX: Use safer where operation with existing mask
+                    observations = mx.where(mask, next_observations, observations)
             else:
-                # Use fixed learn probability
-                learn_mask = alive_agents & (learn_rand < learn_prob)
-            
-            # Only attempt learning if at least one agent should learn
-            if mx.sum(learn_mask) > 0:
-                # Let the agent's learn method handle batching and energy checks
-                try:
-                    # Pass alive_agents mask to learn method
-                    self.agents.learn(observations, reward_batch, alive_mask=alive_agents)
-                except Exception as e:
-                    logger.warning(f"Learning failed: {e}. Continuing with simulation.")
-        
-        # Update agent energy recovery with performance factor (batched)
-        self.agents.update_energy(performance_factor)
-        
-        # Get updated energy after recovery
-        energy = self.agents.get_energy()
-        
-        # Update alive status based on done flag and energy
-        new_alive_agents = alive_agents & ~done_batch & (energy > 0)
-        n_alive = mx.sum(new_alive_agents).item()
-        
-        # Update observations for agents that are still alive
-        if hasattr(observations, 'shape') and hasattr(next_observations, 'shape'):
-            # Verify observation array dimensions
-            if observations.shape[0] != self.pop_size or next_observations.shape[0] != self.pop_size:
-                logger.warning(f"Observation dimension mismatch. Expected pop_size={self.pop_size}, "
-                               f"got observations shape={observations.shape}, next_observations shape={next_observations.shape}")
-                # Reset observations to default
+                # Get fresh observations if dimensions don't match
                 observations = self._get_default_observations()
-            else:
-                # Create a mask for selecting observations by expanding dimensions for proper broadcasting
-                mask = mx.expand_dims(new_alive_agents, axis=1)
-                # Broadcast mask to match observation dimensions
-                mask = mx.broadcast_to(mask, observations.shape)
-                # Update observations using where
-                observations = mx.where(mask, next_observations, observations)
-        else:
-            # Get fresh observations if dimensions don't match
-            observations = self._get_default_observations()
-        
-        # Update LCI values - use maximum safe value of 1 for step_counts to avoid division by zero
-        step_counts_safe = mx.maximum(step_counts, 1)
-        lci_values = rewards / step_counts_safe
-        
-        # Update alive agents
-        alive_agents = new_alive_agents
-        
-        return rewards, step_counts, alive_agents, observations, lci_values, n_alive
-        
+            
+            # Update LCI values - use maximum safe value of 1 for step_counts to avoid division by zero
+            # FIX: Use safe operations to prevent tuple issues
+            one_vals = mx.ones(step_counts.shape)
+            step_counts_safe = mx.maximum(step_counts, one_vals)
+            # Convert step counts to float to avoid integer division
+            step_counts_float = step_counts_safe.astype(mx.float32)
+            lci_values = rewards / step_counts_float
+            
+            # Update alive agents
+            alive_agents = new_alive_agents
+            
+            return rewards, step_counts, alive_agents, observations, lci_values, n_alive
+            
+        except Exception as e:
+            logger.error(f"Error in _update_batch_state: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return the original values if there's an error
+            return rewards, step_counts, alive_agents, observations, lci_values, n_alive
+
     def _get_default_observations(self):
         """
         Get default observations for the entire population.
